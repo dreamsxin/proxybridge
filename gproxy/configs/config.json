@@ -1,0 +1,36 @@
+{
+  "os": "linux",
+  "arch": "amd64",
+  "supplierCode":"ipv",
+  "mode":"remote",
+  "centerDomain": "http://192.168.0.202:10888",
+  "dbName":"proxies.db",
+  "port": 5206,
+  "ipScan":true,
+  "ipv6": false,
+  "//":"默认用户名，不填随机生成", 
+  "username": "",
+  "//":"默认密码",
+  "password": "",
+  "tcpTimeout": 0,
+  "udpTimeout": 60,
+  "key":"qZ3RI9Bwn4ale2u3nVbDMgvOkR1Y8v1SFq7+c/pXy9s=",
+  "log":{
+    "output": "",
+    "level": "info",
+    "maxAge": 7,
+    "maxSize": 100,
+    "maxBackups": 3,
+    "format": "json"
+  },
+  "//": "访问控制 0无限制 1禁止大陆 2禁止海外",
+  "accessMode":1,
+  "//": "本地模式配置访问白名单和后最过滤,白名单大于黑名单",
+  "srcWhiteList":["172.28.197.139","172.28.192.1"],
+  "blackDomainSuffixes":["gov.cn"],
+  "uploadLog":{
+    "enable":false,
+    "addr":"http://192.168.0.250:7788/upload"
+  },
+  "geoDb": "assets/GeoLite2-City.mmdb"
+}

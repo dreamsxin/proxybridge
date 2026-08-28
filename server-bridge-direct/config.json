@@ -1,0 +1,12 @@
+{
+    "mode":"local",
+    "addr": ":5678",
+    "logFile": "logs/bridge.log",
+    "logLevel":"debug",
+    "logFormat":"text",
+    "logSource":true,
+    "syncDomain":"http://192.168.0.250:7888",
+    "key":"abcd1234poiu5678bvbvnbnb",
+    "dataFilename":"bridge.db",
+    "bridgeId":12314
+}

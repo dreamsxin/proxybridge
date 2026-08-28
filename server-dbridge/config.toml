@@ -1,0 +1,24 @@
+# 动态桥配置文件
+
+# 入站代理监听地址（HTTP/SOCKS5 共用端口）
+proxy_addr = ":7890"
+
+[log]
+# 日志级别：debug、info、warn、error
+level = "info"
+
+# 日志文件路径；留空或删除该字段时输出到标准输出
+file = "logs/dbridge.log"
+
+# 单个日志文件最大大小，单位 MB；达到后自动切割
+max_size_mb = 100
+
+[center]
+# 中心服务器地址
+url = "http://127.0.0.1:8080"
+
+# 桥 ID（在中心服务器 bridge_gateway 表中的 id）
+bridge_id = 1
+
+# 桥鉴权密钥（对应 bridge_gateway.secret 字段）
+bridge_secret = "your-bridge-secret"

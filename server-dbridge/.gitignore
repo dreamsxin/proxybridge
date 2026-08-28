@@ -1,0 +1,6 @@
+.idea
+config.local.toml
+example*/
+*.exe
+build*
+dbridge
