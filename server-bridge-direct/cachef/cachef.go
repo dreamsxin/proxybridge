@@ -2,7 +2,10 @@ package cachef
 
 import (
 	"bufio"
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strconv"
@@ -23,135 +26,177 @@ type CacheF struct {
 }
 
 func New(filename string) (*CacheF, error) {
-	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, os.ModePerm)
+	// 0600：转发映射表不应对其他用户可读写
+	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
-		slog.Error("openfile", "err", err)
+		slog.Error("openfile", "filename", filename, "err", err)
 		return nil, err
 	}
 	cf := &CacheF{
 		file: f,
 		rwm:  &sync.RWMutex{},
+		data: make([]*Bridge, 0),
 	}
 
 	fi, err := f.Stat()
 	if err != nil {
-		fmt.Println("Stat err")
+		slog.Error("stat", "filename", filename, "err", err)
+		f.Close()
 		return nil, err
 	}
 	if fi.Size() == 0 {
-		cf.data = make([]*Bridge, 0)
 		return cf, nil
 	}
 
 	if err := cf.unmarshal(); err != nil {
-		fmt.Println("Size = unmarshal")
-		slog.Error("unmarshal", "err", err)
+		slog.Error("unmarshal", "filename", filename, "err", err)
+		f.Close()
 		return nil, err
 	}
 	return cf, nil
 }
 
+// dump 全量重写数据文件。调用方必须持有 rwm 写锁。
 func (s *CacheF) dump() error {
-	s.file.Truncate(0)
-	s.file.Seek(0, 0)
-
-	records := make([]byte, 0, 1024)
-	for _, b := range s.data {
-		fmt.Println("port", b.Port)
-		record := fmt.Sprintf("%d,%s\n", b.Port, b.ProxyAddr)
-		records = append(records, []byte(record)...)
+	if err := s.file.Truncate(0); err != nil {
+		slog.Error("dump truncate", "err", err)
+		return err
 	}
-	s.file.Write(records)
+	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+		slog.Error("dump seek", "err", err)
+		return err
+	}
+
+	var buf bytes.Buffer
+	for _, b := range s.data {
+		fmt.Fprintf(&buf, "%d,%s\n", b.Port, b.ProxyAddr)
+	}
+	if _, err := s.file.Write(buf.Bytes()); err != nil {
+		slog.Error("dump write", "count", len(s.data), "err", err)
+		return err
+	}
+	if err := s.file.Sync(); err != nil {
+		slog.Error("dump sync", "count", len(s.data), "err", err)
+		return err
+	}
+	slog.Debug("dump", "count", len(s.data))
 	return nil
 }
 
 func (s *CacheF) unmarshal() error {
 	s.rwm.Lock()
 	defer s.rwm.Unlock()
+
+	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
 	reader := bufio.NewReader(s.file)
+	lineNo := 0
 	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			break // 到文件末尾或发生错误
-		}
-		line = strings.TrimRight(line, "\r\n")
-		fmt.Println("line", line)
-		if line == "" {
-			continue
-		}
-		if strings.HasPrefix(line, "#") {
-			continue
-		}
-		record := strings.Split(line, ",")
-		if len(record) == 2 {
-			if strings.Contains(record[0], ":") {
-				ports := strings.Split(record[0], ":")
-				if len(ports) == 2 {
-					bPort, err := strconv.ParseUint(ports[0], 10, 64)
-					if err != nil {
-						return err
-					}
-					if bPort < 1 || bPort > 65535 {
-						return fmt.Errorf("port err %d", bPort)
-					}
-					ePort, err := strconv.ParseUint(ports[1], 10, 64)
-					if err != nil {
-						return err
-					}
-
-					if ePort < 1 || ePort > 65535 {
-						return fmt.Errorf("port err %d", bPort)
-					}
-
-					if bPort > ePort {
-						t := bPort
-						bPort = ePort
-						ePort = t
-					}
-					for port := bPort; port <= ePort; port++ {
-						b := &Bridge{
-							Port:      uint16(port),
-							ProxyAddr: record[1],
-						}
-						s.data = append(s.data, b)
-					}
-				}
-			} else {
-				port, err := strconv.ParseUint(record[0], 10, 64)
-				if err != nil {
-					continue
-				}
-				b := &Bridge{
-					Port:      uint16(port),
-					ProxyAddr: record[1],
-				}
-				s.data = append(s.data, b)
+		line, readErr := reader.ReadString('\n')
+		// ReadString 在文件末尾会同时返回最后一段数据和 io.EOF，
+		// 必须先处理 line 再判断 err，否则末行无换行符时该条记录会被丢弃。
+		if line != "" {
+			lineNo++
+			if err := s.parseLineLocked(strings.TrimRight(line, "\r\n"), lineNo); err != nil {
+				return err
 			}
 		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				slog.Error("unmarshal read", "line", lineNo, "err", readErr)
+				return readErr
+			}
+			break
+		}
 	}
+	slog.Info("cache loaded", "count", len(s.data))
 	return nil
+}
 
-	//return gocsv.UnmarshalFile(s.file, &s.data)
+// parseLineLocked 解析一行 "port,proxyAddr" 或 "beginPort:endPort,proxyAddr"。
+// 调用方必须持有 rwm 写锁。
+func (s *CacheF) parseLineLocked(line string, lineNo int) error {
+	if line == "" || strings.HasPrefix(line, "#") {
+		return nil
+	}
+	record := strings.Split(line, ",")
+	if len(record) != 2 {
+		slog.Warn("cache skip malformed line", "line", lineNo, "content", line)
+		return nil
+	}
+	portField := strings.TrimSpace(record[0])
+	proxyAddr := strings.TrimSpace(record[1])
+	if proxyAddr == "" {
+		slog.Warn("cache skip empty proxyAddr", "line", lineNo, "content", line)
+		return nil
+	}
+
+	if strings.Contains(portField, ":") {
+		ports := strings.Split(portField, ":")
+		if len(ports) != 2 {
+			slog.Warn("cache skip malformed port range", "line", lineNo, "content", line)
+			return nil
+		}
+		bPort, err := parsePort(ports[0])
+		if err != nil {
+			slog.Error("cache parse port range", "line", lineNo, "content", line, "err", err)
+			return err
+		}
+		ePort, err := parsePort(ports[1])
+		if err != nil {
+			slog.Error("cache parse port range", "line", lineNo, "content", line, "err", err)
+			return err
+		}
+		if bPort > ePort {
+			bPort, ePort = ePort, bPort
+		}
+		// 用 uint32 做循环变量：ePort 为 65535 时 uint16 自增会回绕成 0 而死循环
+		for p := uint32(bPort); p <= uint32(ePort); p++ {
+			s.upsertLocked(uint16(p), proxyAddr)
+		}
+		return nil
+	}
+
+	port, err := parsePort(portField)
+	if err != nil {
+		slog.Warn("cache skip invalid port", "line", lineNo, "content", line, "err", err)
+		return nil
+	}
+	s.upsertLocked(port, proxyAddr)
+	return nil
+}
+
+func parsePort(field string) (uint16, error) {
+	p, err := strconv.ParseUint(strings.TrimSpace(field), 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	if p < 1 || p > 65535 {
+		return 0, fmt.Errorf("port out of range %d", p)
+	}
+	return uint16(p), nil
+}
+
+// upsertLocked 覆盖同端口的已有记录而不是追加，避免出现重复端口条目
+// （重复条目会让 Get/Del 只命中第一条，导致监听与缓存状态分叉）。
+// 调用方必须持有 rwm 写锁。
+func (s *CacheF) upsertLocked(port uint16, proxyAddr string) {
+	b := &Bridge{Port: port, ProxyAddr: proxyAddr}
+	for idx, cur := range s.data {
+		if cur.Port == port {
+			s.data[idx] = b
+			return
+		}
+	}
+	s.data = append(s.data, b)
 }
 
 func (s *CacheF) Add(port uint16, proxyAddr string) error {
 	s.rwm.Lock()
 	defer s.rwm.Unlock()
-	b := &Bridge{
-		Port:      port,
-		ProxyAddr: proxyAddr,
-	}
-	flag := true
-	for idx, cur := range s.data {
-		if cur.Port == port {
-			s.data[idx] = b
-			flag = false
-			break
-		}
-	}
-	if flag {
-		s.data = append(s.data, b)
-	}
+	s.upsertLocked(port, proxyAddr)
 	return s.dump()
 }
 
@@ -159,19 +204,8 @@ func (s *CacheF) BatchAdd(bridges []Bridge) error {
 	s.rwm.Lock()
 	defer s.rwm.Unlock()
 	for _, bridge := range bridges {
-		flag := true
-		for idx, cur := range s.data {
-			if cur.Port == bridge.Port {
-				s.data[idx] = &bridge
-				flag = false
-				break
-			}
-		}
-		if flag {
-			s.data = append(s.data, &bridge)
-		}
+		s.upsertLocked(bridge.Port, bridge.ProxyAddr)
 	}
-	fmt.Println(s.data)
 	return s.dump()
 }
 
@@ -203,23 +237,33 @@ func (s *CacheF) Get(port uint16) *Bridge {
 func (s *CacheF) Del(port uint16) error {
 	s.rwm.Lock()
 	defer s.rwm.Unlock()
-	flag := false
-	for idx, cur := range s.data {
+	// 删除全部同端口条目：历史数据文件里可能已存在重复端口
+	kept := s.data[:0]
+	removed := 0
+	for _, cur := range s.data {
 		if cur.Port == port {
-			s.data = append(s.data[:idx], s.data[idx+1:]...)
-			flag = true
-			break
+			removed++
+			continue
 		}
+		kept = append(kept, cur)
 	}
-	if flag {
-		return s.dump()
+	if removed == 0 {
+		slog.Debug("cache del miss", "port", port)
+		return nil
 	}
-	return nil
+	s.data = kept
+	slog.Debug("cache del", "port", port, "removed", removed)
+	return s.dump()
 }
 
 func (s *CacheF) Close() {
+	s.rwm.Lock()
+	defer s.rwm.Unlock()
 	s.data = nil
 	if s.file != nil {
-		s.file.Close()
+		if err := s.file.Close(); err != nil {
+			slog.Error("cache close", "err", err)
+		}
+		s.file = nil
 	}
 }

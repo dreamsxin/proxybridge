@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"syscall"
+
 
 	"github.com/baowk/bridge-direct/config"
 	"github.com/baowk/bridge-direct/server"
@@ -50,14 +52,21 @@ func main() {
 	//初始化日志
 	initLog()
 
+	// AES key 长度必须是 16/24/32，否则每个管理请求都会在解密时失败，
+	// 服务看起来正常但功能全废——必须在启动时就暴露出来
+	if n := len(config.Cfg.Key); n != 16 && n != 24 && n != 32 {
+		slog.Error("invalid aes key length, want 16/24/32", "length", n)
+		os.Exit(1)
+	}
+
+	slog.Info("bridge-direct starting", "version", VERSION, "mode", config.Cfg.Mode)
+
 	go server.Start()
 
-	slog.Info("bridge-direct started", "version", VERSION)
-
 	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt)
-	<-quit
-
+	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
+	sig := <-quit
+	slog.Info("bridge-direct shutting down", "signal", sig.String())
 }
 
 func printVersion() {
