@@ -103,7 +103,13 @@ func initLog() {
 			// 对backup的日志是否进行压缩，默认不压缩
 			Compress: true,
 		}
+		// 同时输出到控制台，便于本地调试。
+		// 生产环境交给 journald/docker 收集时可关掉，避免重复采集。
+		if config.Cfg.LogConsole {
+			logW = io.MultiWriter(os.Stdout, logW)
+		}
 	}
+
 	if config.Cfg.LogLevel == "error" {
 		opts.Level = slog.LevelError
 	} else if config.Cfg.LogLevel == "info" {

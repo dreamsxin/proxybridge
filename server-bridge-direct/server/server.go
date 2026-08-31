@@ -37,7 +37,10 @@ func Start() {
 			slog.Error("syncBridge", "syncDomain", config.Cfg.SyncDomain,
 				"bridgeId", config.Cfg.BridgeId, "err", err)
 		}
+	} else {
+		slog.Info("local mode: skip syncBridge and management api", "mode", config.Cfg.Mode)
 	}
+
 
 	InitBridgeHandler()
 
