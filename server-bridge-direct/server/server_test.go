@@ -281,6 +281,61 @@ func TestConcurrentAddAndDelSameBridgePort(t *testing.T) {
 	assertProxyResponse(t, bridgePort, "first")
 }
 
+// 管理接口的锁必须是端口粒度：一次慢操作（DelBridgeHandler 最坏等 stopTimeout=10s，
+// 或一次卡住的 fsync）只能堵住同端口的请求，不能把其它端口的请求排在后面
+func TestManagementLockIsPerPort(t *testing.T) {
+	setupServerTest(t)
+
+	target := startTCPServer(t, "first")
+	busyPort := freeTCPPort(t)
+	otherPort := freeTCPPort(t)
+
+	// 直接占住 busyPort 的管理锁，等价于该端口上正在跑一次慢操作
+	release := lockPort(busyPort)
+	releaseOnce := sync.OnceFunc(release)
+	defer releaseOnce()
+
+	other := make(chan dto.Res, 1)
+	go func() {
+		res, _ := doBridgeRequest("/bridge/add", dto.UseBridge{
+			BridgePort: otherPort, Ip: target.host, Port: target.port,
+		}, AddBridge)
+		other <- res
+	}()
+	select {
+	case res := <-other:
+		if res.Code != 200 {
+			t.Fatalf("add on a free port failed: %+v", res)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("add on another port was blocked by a busy port: the management lock is global")
+	}
+
+	// 同一端口仍然必须互斥，否则就回到了状态分叉
+	same := make(chan struct{})
+	go func() {
+		defer close(same)
+		_, _ = doBridgeRequest("/bridge/add", dto.UseBridge{
+			BridgePort: busyPort, Ip: target.host, Port: target.port,
+		}, AddBridge)
+	}()
+	select {
+	case <-same:
+		t.Fatal("same-port add was not serialized against the held lock")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	releaseOnce()
+	select {
+	case <-same:
+	case <-time.After(5 * time.Second):
+		t.Fatal("same-port add did not proceed after the lock was released")
+	}
+
+	assertConsistent(t, busyPort)
+	assertConsistent(t, otherPort)
+}
+
 // 目标未变且监听在跑时，重复 add 不能重建监听，否则会踢掉该端口上所有在途连接
 func TestAddBridgeUnchangedDoesNotRebuildListener(t *testing.T) {
 	setupServerTest(t)

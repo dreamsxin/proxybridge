@@ -29,10 +29,24 @@ var cf *cachef.CacheF
 // 在响应里体现出来，不能设太长，否则会拖住管理接口。
 const listenReadyTimeout = 500 * time.Millisecond
 
-// apiMu 串行化管理接口。cf（持久化映射表）和 runListens（实际监听）是两份独立状态，
-// 并发的 add/del 会在「查缓存」和「改监听」之间产生分叉，表现为
-// "port N already listening" 或删除后监听仍在。
-var apiMu sync.Mutex
+// portLocks 按端口串行化管理接口。cf（持久化映射表）和 runListens（实际监听）是
+// 两份独立状态，同一端口上并发的 add/del 会在「查缓存」和「改监听」之间产生分叉，
+// 表现为 "port N already listening" 或删除后监听仍在。
+//
+// 用端口粒度而不是全局一把锁：这两份状态的一致性约束只存在于同一端口内部，
+// 跨端口没有共享不变量（数据文件由 cachef 自己的锁保护）。全局锁会让一次慢操作
+// —— 比如 DelBridgeHandler 最坏等 stopTimeout=10s，或者一次 fsync 卡住 ——
+// 把其它端口的管理请求全部堵在后面（队头阻塞）。
+var portLocks sync.Map // uint16 -> *sync.Mutex
+
+// lockPort 返回解锁函数。条目不回收：端口数上限 65535，常驻内存可忽略，
+// 而回收会引入「删除瞬间另一个请求正持有该锁」的竞态。
+func lockPort(port uint16) func() {
+	value, _ := portLocks.LoadOrStore(port, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
 
 func Start() {
 	var err error
@@ -149,8 +163,8 @@ func AddBridge(c *gin.Context) {
 		return
 	}
 
-	apiMu.Lock()
-	defer apiMu.Unlock()
+	unlock := lockPort(bridge.BridgePort)
+	defer unlock()
 
 	toAddr := net.JoinHostPort(bridge.Ip, strconv.FormatUint(uint64(bridge.Port), 10))
 	slog.Info("AddBridge", "clientIP", c.ClientIP(), "port", bridge.BridgePort, "toAddr", toAddr)
@@ -218,8 +232,8 @@ func DelBridge(c *gin.Context) {
 		return
 	}
 
-	apiMu.Lock()
-	defer apiMu.Unlock()
+	unlock := lockPort(bridge.BridgePort)
+	defer unlock()
 
 	slog.Info("DelBridge", "clientIP", c.ClientIP(), "port", bridge.BridgePort)
 
