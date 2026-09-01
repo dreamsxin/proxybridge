@@ -49,6 +49,8 @@ func main() {
 	if err = v.Unmarshal(&config.Cfg); err != nil {
 		panic(err)
 	}
+	// 缺失项用缺省值兜底，尤其是日志轮转：没有上界的日志迟早把磁盘写满
+	config.Cfg.ApplyDefaults()
 	//初始化日志
 	initLog()
 
@@ -78,44 +80,48 @@ func printVersion() {
 func initLog() {
 	opts := slog.HandlerOptions{
 		AddSource: config.Cfg.LogSource,
-		Level:     slog.LevelDebug,
 	}
 
 	var logW io.Writer
 
 	if config.Cfg.LogFile == "" {
+		// 注意：这条路径进程内没有任何轮转，必须由 systemd/journald 或容器运行时
+		// 负责收集和限额，别用 nohup 重定向到文件——那就是无上界增长
 		logW = os.Stdout
 	} else {
 		logW = &lumberjack.Logger{
 			// 日志文件名，归档日志也会保存在对应目录下
-			// 若该值为空，则日志会保存到os.TempDir()目录下，日志文件名为
-			// <processname>-lumberjack.log
 			Filename: config.Cfg.LogFile,
-
 			// backup的日志是否使用本地时间戳，默认使用UTC时间
 			LocalTime: true,
-			// 日志大小到达MaxSize(MB)就开始backup，默认值是100.
-			MaxSize: 100,
-			// 旧日志保存的最大天数，默认保存所有旧日志文件
-			MaxAge: 7,
-			// 旧日志保存的最大数量，默认保存所有旧日志文件
-			MaxBackups: 10,
-			// 对backup的日志是否进行压缩，默认不压缩
-			Compress: true,
+			// 单文件大小上限(MB)，到达就切割
+			MaxSize: config.Cfg.LogMaxSizeMB,
+			// 归档保留天数
+			MaxAge: config.Cfg.LogMaxAgeDays,
+			// 归档保留个数，与 MaxAge 谁先满足谁生效
+			MaxBackups: config.Cfg.LogMaxBackups,
+			// 归档是否压缩
+			Compress: config.Cfg.LogCompressEnabled(),
 		}
 		// 同时输出到控制台，便于本地调试。
-		// 生产环境交给 journald/docker 收集时可关掉，避免重复采集。
+		// 生产环境交给 journald/docker 收集时应关掉，避免重复采集，
+		// 而且 stdout 那份不受上面的轮转策略约束。
 		if config.Cfg.LogConsole {
 			logW = io.MultiWriter(os.Stdout, logW)
 		}
 	}
 
-	if config.Cfg.LogLevel == "error" {
+	switch config.Cfg.LogLevel {
+	case "error":
 		opts.Level = slog.LevelError
-	} else if config.Cfg.LogLevel == "info" {
-		opts.Level = slog.LevelInfo
-	} else if config.Cfg.LogLevel == "warn" {
+	case "warn":
 		opts.Level = slog.LevelWarn
+	case "debug":
+		// debug 会给每条连接打 flow-up/flow-down 两行，SOCKS5 场景下日志量
+		// 按连接数放大，只适合本地排查
+		opts.Level = slog.LevelDebug
+	default:
+		opts.Level = slog.LevelInfo
 	}
 	if config.Cfg.LogFormat == "json" {
 		config.Logger = slog.New(slog.NewJSONHandler(logW, &opts))
