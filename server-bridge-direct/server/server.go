@@ -8,8 +8,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	_ "net/http/pprof" // 仅在配置了 pprofAddr 时才对外提供
+	"runtime"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/baowk/bridge-direct/cachef"
 	"github.com/baowk/bridge-direct/config"
@@ -18,7 +21,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+
 var cf *cachef.CacheF
+
+// listenReadyTimeout 是 AddBridge 等待 bind 结果的上限。
+// 正常情况下 bind 是微秒级的；这里只为把「端口被占用、正在退避重试」这种情况
+// 在响应里体现出来，不能设太长，否则会拖住管理接口。
+const listenReadyTimeout = 500 * time.Millisecond
 
 // apiMu 串行化管理接口。cf（持久化映射表）和 runListens（实际监听）是两份独立状态，
 // 并发的 add/del 会在「查缓存」和「改监听」之间产生分叉，表现为
@@ -31,6 +40,12 @@ func Start() {
 		panic(err)
 	}
 
+	startPprof(config.Cfg.PprofAddr)
+	startStatsLogger(config.Cfg.StatsInterval)
+	// 必须在起任何桥之前设置全局配额
+	InitConnLimits()
+
+
 	if config.Cfg.Mode != config.MODE_LOCAL {
 		//同步桥
 		if err := syncBridge(); err != nil {
@@ -40,7 +55,6 @@ func Start() {
 	} else {
 		slog.Info("local mode: skip syncBridge and management api", "mode", config.Cfg.Mode)
 	}
-
 
 	InitBridgeHandler()
 
@@ -58,6 +72,68 @@ func Start() {
 		}
 	}
 }
+
+// startPprof 按需开启 pprof。空地址=关闭。
+// pprof 没有任何鉴权，暴露出去等于把进程内存和调用栈公开，只能绑回环或内网。
+func startPprof(addr string) {
+	if addr == "" {
+		return
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		slog.Error("pprof addr invalid", "addr", addr, "err", err)
+		return
+	}
+	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+		slog.Warn("pprof is NOT authenticated, binding to a non-loopback address exposes heap and stacks",
+			"addr", addr)
+	}
+
+	go func() {
+		slog.Info("pprof listening", "addr", addr,
+			"hint", "goroutine: /debug/pprof/goroutine?debug=2, heap: /debug/pprof/heap")
+		srv := &http.Server{
+			Addr:              addr,
+			Handler:           http.DefaultServeMux, // net/http/pprof 注册在 DefaultServeMux
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		if err := srv.ListenAndServe(); err != nil {
+			slog.Error("pprof server exited", "addr", addr, "err", err)
+		}
+	}()
+}
+
+// startStatsLogger 定期输出运行水位，用于判断 goroutine/连接/内存是否在单调增长
+func startStatsLogger(intervalSec int) {
+	if intervalSec <= 0 {
+		return
+	}
+	interval := time.Duration(intervalSec) * time.Second
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for range t.C {
+			bs := CollectBridgeStats()
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			slog.Info("stats",
+				"goroutines", runtime.NumGoroutine(),
+				"bridges", bs.Bridges,
+				// listening < bridges 说明有桥卡在 bind 重试上
+				"listening", bs.Listening,
+				"conns", bs.Conns,
+				"accepted", bs.Accepted,
+				// rejected 增长说明撞到了并发上限
+				"rejected", bs.Rejected,
+				"dialOK", bs.DialOK,
+				"dialFail", bs.DialFail,
+				"heapAllocMB", ms.HeapAlloc>>20,
+				"sysMB", ms.Sys>>20,
+				"numGC", ms.NumGC)
+		}
+	}()
+}
+
 
 func AddBridge(c *gin.Context) {
 	var bridge dto.UseBridge
@@ -85,12 +161,22 @@ func AddBridge(c *gin.Context) {
 		prevAddr = prev.ProxyAddr
 	}
 
-	// AddBridgeHandler 是幂等的，新增与改目标同一路径，不再按缓存有无分支
-	if err := AddBridgeHandler(bridge.BridgePort, toAddr); err != nil {
+	// 目标未变且监听在跑：什么都不做，省掉一次全量重写数据文件+fsync。
+	// 注意这里必须同时检查监听是否真的存在：只看缓存会在
+	// 「启动时 bind 失败、记录还在但监听没起来」的情况下永远修不回来。
+	if prevAddr == toAddr && hasBridgeHandler(bridge.BridgePort) {
+		slog.Info("AddBridge unchanged", "port", bridge.BridgePort, "toAddr", toAddr)
+		respOKData(c, map[string]any{"listening": true})
+		return
+	}
+
+	// SetBridgeHandler 幂等：已有监听时只原子替换目标，不重建监听
+	if err := SetBridgeHandler(bridge.BridgePort, toAddr); err != nil {
 		slog.Error("AddBridge listen", "port", bridge.BridgePort, "toAddr", toAddr, "err", err)
 		respFail(c, err)
 		return
 	}
+
 
 	if err := cf.Add(bridge.BridgePort, toAddr); err != nil {
 		slog.Error("AddBridge persist", "port", bridge.BridgePort, "toAddr", toAddr, "err", err)
@@ -99,8 +185,23 @@ func AddBridge(c *gin.Context) {
 		return
 	}
 
+	// bind 由 supervisor 异步执行且失败会一直退避重试。这里等一小会儿确认结果：
+	// 没监听上就直接给管理端报错（记录保留、supervisor 继续重试，端口一释放自愈），
+	// 让中心侧立刻知道这条桥当前不通，而不是收到 200 却没有流量。
+	listening, bindErr := WaitBridgeListening(bridge.BridgePort, listenReadyTimeout)
+	if !listening {
+		if bindErr == "" {
+			bindErr = "bind not completed yet"
+		}
+		err := fmt.Errorf("port %d is not listening: %s", bridge.BridgePort, bindErr)
+		slog.Error("AddBridge not listening", "port", bridge.BridgePort,
+			"toAddr", toAddr, "err", bindErr)
+		respFailData(c, err, map[string]any{"listening": false, "retrying": true})
+		return
+	}
+
 	slog.Info("AddBridge ok", "port", bridge.BridgePort, "toAddr", toAddr)
-	respOK(c)
+	respOKData(c, map[string]any{"listening": true})
 }
 
 func DelBridge(c *gin.Context) {
@@ -148,10 +249,11 @@ func rollbackHandler(port uint16, prevAddr string) {
 		}
 		return
 	}
-	if err := AddBridgeHandler(port, prevAddr); err != nil {
+	if err := SetBridgeHandler(port, prevAddr); err != nil {
 		slog.Error("rollback restore", "port", port, "toAddr", prevAddr, "err", err)
 	}
 }
+
 
 func respFail(c *gin.Context, err error) {
 	c.JSON(http.StatusOK, dto.Res{
@@ -160,10 +262,26 @@ func respFail(c *gin.Context, err error) {
 	})
 }
 
+func respFailData(c *gin.Context, err error, data any) {
+	c.JSON(http.StatusOK, dto.Res{
+		Code: 500,
+		Msg:  err.Error(),
+		Data: data,
+	})
+}
+
 func respOK(c *gin.Context) {
 	c.JSON(http.StatusOK, dto.Res{
 		Code: 200,
 		Msg:  "ok",
+	})
+}
+
+func respOKData(c *gin.Context, data any) {
+	c.JSON(http.StatusOK, dto.Res{
+		Code: 200,
+		Msg:  "ok",
+		Data: data,
 	})
 }
 
@@ -197,7 +315,40 @@ func validateBridge(bridge dto.UseBridge) error {
 	if ip == nil || ip.IsUnspecified() {
 		return errors.New("invalid ip")
 	}
+	if who, ok := selfPorts()[bridge.BridgePort]; ok {
+		return fmt.Errorf("bridgePort %d conflicts with %s", bridge.BridgePort, who)
+	}
 	return nil
+}
+
+// selfPorts 返回本进程自己占着的端口。撞上这些端口必须在入口拒掉：
+// 它们不在 runListens 里，走不到「己方桥占用 → 只换目标」的路径，
+// 而 bind 又永远不可能成功（同进程同端口不能二次 bind），
+// 放进去的结果只是 supervisor 无限退避重试 + 刷 error 日志。
+func selfPorts() map[uint16]string {
+	ports := make(map[uint16]string, 2)
+	if p, ok := portFromAddr(config.Cfg.Addr); ok {
+		ports[p] = "management addr"
+	}
+	if p, ok := portFromAddr(config.Cfg.PprofAddr); ok {
+		ports[p] = "pprof addr"
+	}
+	return ports
+}
+
+func portFromAddr(addr string) (uint16, bool) {
+	if addr == "" {
+		return 0, false
+	}
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, false
+	}
+	p, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || p == 0 {
+		return 0, false
+	}
+	return uint16(p), true
 }
 
 func syncBridge() error {

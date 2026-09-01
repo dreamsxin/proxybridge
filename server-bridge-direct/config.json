@@ -1,15 +1,18 @@
 {
     "mode":"local",
-
     "addr": ":5678",
     "logFile": "logs/bridge.log",
     "logConsole": true,
     "logLevel":"debug",
-
     "logFormat":"text",
     "logSource":true,
     "syncDomain":"http://192.168.0.250:7888",
     "key":"abcd1234poiu5678bvbvnbnb",
     "dataFilename":"bridge.db",
-    "bridgeId":12314
+    "bridgeId":12314,
+    "pprofAddr": "127.0.0.1:6060",
+    "statsInterval": 60,
+    "connIdleTimeout": 0,
+    "maxConnsPerPort": 0,
+    "maxConns": 0
 }
