@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
 
 func TestCachef(t *testing.T) {
-	filename := "abc.txt"
+	filename := filepath.Join(t.TempDir(), "abc.txt")
 	cf, err := New(filename)
 	if err != nil {
 		t.Error(err)
@@ -36,7 +38,133 @@ func TestCachef(t *testing.T) {
 
 }
 
-// 末行没有换行符时，该条记录不能被丢弃
+// 正常写入后目录里只应有数据文件本身：临时文件必须被 rename 掉或清理掉
+func TestDumpLeavesNoTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "bridge.db")
+
+	cf, err := New(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cf.Close)
+
+	for i := 0; i < 5; i++ {
+		if err := cf.Add(uint16(8001+i), "1.2.3.4:80"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := cf.Del(8003); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("leftover temp file %s", entry.Name())
+		}
+	}
+	if len(entries) != 1 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("dir contains %v, want only bridge.db", names)
+	}
+}
+
+// dump 失败时不能破坏已有数据：旧实现先 Truncate 再写，失败就留下空文件或半截内容。
+// 这里让临时文件创建失败（目录不可写），断言数据文件仍然是上一次的完整内容。
+func TestFailedDumpKeepsPreviousFileIntact(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows 上目录权限位不生效，无法制造写失败")
+	}
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "bridge.db")
+
+	cf, err := New(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cf.Close)
+	if err := cf.Add(8001, "1.2.3.4:80"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	if err := cf.Add(8002, "5.6.7.8:90"); err == nil {
+		t.Fatal("expected dump to fail while the directory is read-only")
+	}
+
+	after, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("data file changed after a failed dump: %q -> %q", before, after)
+	}
+
+	// 恢复目录权限后重新加载：磁盘上仍是失败前的状态，不会出现空文件
+	os.Chmod(dir, 0o700)
+	reloaded, err := New(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(reloaded.Close)
+	if got := len(reloaded.All()); got != 1 {
+		t.Fatalf("reloaded %d bridges, want 1", got)
+	}
+	if b := reloaded.Get(8001); b == nil || b.ProxyAddr != "1.2.3.4:80" {
+		t.Fatalf("port 8001 = %+v, want proxyAddr 1.2.3.4:80", b)
+	}
+}
+
+// 崩在 rename 之前会留下临时文件：它不叫 bridge.db，所以不能影响加载结果
+func TestStaleTempFileIsIgnoredOnLoad(t *testing.T) {
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "bridge.db")
+	if err := os.WriteFile(filename, []byte("8001,1.2.3.4:80\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// 上次崩溃遗留的半截临时文件
+	if err := os.WriteFile(filename+".tmp-123456", []byte("9999,garbage"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cf, err := New(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cf.Close)
+
+	if got := len(cf.All()); got != 1 {
+		t.Fatalf("loaded %d bridges, want 1", got)
+	}
+	if cf.Get(9999) != nil {
+		t.Fatal("stale temp file leaked into the loaded data")
+	}
+	if err := cf.Add(8002, "5.6.7.8:90"); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "8001,1.2.3.4:80\n8002,5.6.7.8:90\n"; string(content) != want {
+		t.Fatalf("data file = %q, want %q", content, want)
+	}
+}
 func TestUnmarshalKeepsLastLineWithoutNewline(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "bridge.db")
 	if err := os.WriteFile(filename, []byte("8001,1.2.3.4:80\n8002,5.6.7.8:90"), 0600); err != nil {

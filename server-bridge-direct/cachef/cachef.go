@@ -8,6 +8,8 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,78 +22,120 @@ type Bridge struct {
 }
 
 type CacheF struct {
-	file *os.File
-	data []*Bridge
-	rwm  *sync.RWMutex
+	filename string
+	data     []*Bridge
+	rwm      *sync.RWMutex
 }
 
 func New(filename string) (*CacheF, error) {
-	// 0600：转发映射表不应对其他用户可读写
-	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0600)
-	if err != nil {
-		slog.Error("openfile", "filename", filename, "err", err)
-		return nil, err
+	if filename == "" {
+		return nil, errors.New("cache filename is required")
 	}
 	cf := &CacheF{
-		file: f,
-		rwm:  &sync.RWMutex{},
-		data: make([]*Bridge, 0),
+		filename: filename,
+		rwm:      &sync.RWMutex{},
+		data:     make([]*Bridge, 0),
 	}
 
-	fi, err := f.Stat()
+	content, err := os.ReadFile(filename)
 	if err != nil {
-		slog.Error("stat", "filename", filename, "err", err)
-		f.Close()
-		return nil, err
+		if !errors.Is(err, os.ErrNotExist) {
+			slog.Error("openfile", "filename", filename, "err", err)
+			return nil, err
+		}
+		// 首次启动：立刻把空文件建出来，目录权限之类的问题在启动时就暴露，
+		// 而不是等到第一次 /bridge/add 才失败
+		if err := cf.dump(); err != nil {
+			return nil, err
+		}
+		return cf, nil
 	}
-	if fi.Size() == 0 {
+	if len(content) == 0 {
 		return cf, nil
 	}
 
-	if err := cf.unmarshal(); err != nil {
+	if err := cf.unmarshal(content); err != nil {
 		slog.Error("unmarshal", "filename", filename, "err", err)
-		f.Close()
 		return nil, err
 	}
 	return cf, nil
 }
 
-// dump 全量重写数据文件。调用方必须持有 rwm 写锁。
+// dump 原子地全量重写数据文件：写临时文件 → fsync → rename 覆盖 → fsync 父目录。
+//
+// 旧实现是对同一个 fd 做 Truncate(0) 再重写，进程在 Truncate 与 Sync 之间挂掉
+// （或机器掉电）会留下空文件或半截内容，重启后桥全部丢失或只剩一部分。
+// rename 在同一文件系统内是原子的，崩溃后看到的要么是旧的完整内容、要么是新的完整内容。
+//
+// 调用方必须持有 rwm 写锁。
 func (s *CacheF) dump() error {
-	if err := s.file.Truncate(0); err != nil {
-		slog.Error("dump truncate", "err", err)
-		return err
-	}
-	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
-		slog.Error("dump seek", "err", err)
-		return err
-	}
-
 	var buf bytes.Buffer
 	for _, b := range s.data {
 		fmt.Fprintf(&buf, "%d,%s\n", b.Port, b.ProxyAddr)
 	}
-	if _, err := s.file.Write(buf.Bytes()); err != nil {
+
+	dir := filepath.Dir(s.filename)
+	// 临时文件必须和目标同目录：跨文件系统的 rename 不是原子的，也可能直接失败
+	tmp, err := os.CreateTemp(dir, filepath.Base(s.filename)+".tmp-*")
+	if err != nil {
+		slog.Error("dump create temp", "dir", dir, "err", err)
+		return err
+	}
+	tmpName := tmp.Name()
+	// 失败路径上不留垃圾临时文件；rename 成功后置空跳过清理
+	defer func() {
+		if tmpName != "" {
+			os.Remove(tmpName)
+		}
+	}()
+
+	// CreateTemp 建出来就是 0600，转发映射表不应对其他用户可读写
+	if _, err := tmp.Write(buf.Bytes()); err != nil {
+		tmp.Close()
 		slog.Error("dump write", "count", len(s.data), "err", err)
 		return err
 	}
-	if err := s.file.Sync(); err != nil {
+	// 先 fsync 再 rename：否则崩溃后可能出现「目录项已指向新文件、内容却还没落盘」
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
 		slog.Error("dump sync", "count", len(s.data), "err", err)
 		return err
 	}
+	if err := tmp.Close(); err != nil {
+		slog.Error("dump close temp", "err", err)
+		return err
+	}
+	if err := os.Rename(tmpName, s.filename); err != nil {
+		slog.Error("dump rename", "filename", s.filename, "err", err)
+		return err
+	}
+	tmpName = ""
+	syncDir(dir)
 	slog.Debug("dump", "count", len(s.data))
 	return nil
 }
 
-func (s *CacheF) unmarshal() error {
+// syncDir 让 rename 这个目录项变更本身落盘。Windows 不支持打开目录做 fsync，跳过。
+func syncDir(dir string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	d, err := os.Open(dir)
+	if err != nil {
+		slog.Debug("dump open dir", "dir", dir, "err", err)
+		return
+	}
+	defer d.Close()
+	if err := d.Sync(); err != nil {
+		slog.Debug("dump sync dir", "dir", dir, "err", err)
+	}
+}
+
+func (s *CacheF) unmarshal(content []byte) error {
 	s.rwm.Lock()
 	defer s.rwm.Unlock()
 
-	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-
-	reader := bufio.NewReader(s.file)
+	reader := bufio.NewReader(bytes.NewReader(content))
 	lineNo := 0
 	for {
 		line, readErr := reader.ReadString('\n')
@@ -260,10 +304,4 @@ func (s *CacheF) Close() {
 	s.rwm.Lock()
 	defer s.rwm.Unlock()
 	s.data = nil
-	if s.file != nil {
-		if err := s.file.Close(); err != nil {
-			slog.Error("cache close", "err", err)
-		}
-		s.file = nil
-	}
 }
