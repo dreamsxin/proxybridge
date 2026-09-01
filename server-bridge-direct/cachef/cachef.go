@@ -240,8 +240,20 @@ func (s *CacheF) upsertLocked(port uint16, proxyAddr string) {
 func (s *CacheF) Add(port uint16, proxyAddr string) error {
 	s.rwm.Lock()
 	defer s.rwm.Unlock()
+
+	// 在副本上修改，只有 dump 成功后才替换 s.data。
+	// 这样写盘失败时，内存和磁盘仍然描述同一份状态；直接在原切片上
+	// upsert 会让失败的 Add 留在内存里，下一次请求可能跳过持久化。
+	next := make([]*Bridge, len(s.data), len(s.data)+1)
+	copy(next, s.data)
+	saved := s.data
+	s.data = next
 	s.upsertLocked(port, proxyAddr)
-	return s.dump()
+	if err := s.dump(); err != nil {
+		s.data = saved
+		return err
+	}
+	return nil
 }
 
 // Replace 用一份新集合原子替换全部记录，用于远端同步对账。
@@ -296,7 +308,7 @@ func (s *CacheF) Del(port uint16) error {
 	s.rwm.Lock()
 	defer s.rwm.Unlock()
 	// 删除全部同端口条目：历史数据文件里可能已存在重复端口
-	kept := s.data[:0]
+	kept := make([]*Bridge, 0, len(s.data))
 	removed := 0
 	for _, cur := range s.data {
 		if cur.Port == port {
@@ -309,9 +321,14 @@ func (s *CacheF) Del(port uint16) error {
 		slog.Debug("cache del miss", "port", port)
 		return nil
 	}
+	saved := s.data
 	s.data = kept
 	slog.Debug("cache del", "port", port, "removed", removed)
-	return s.dump()
+	if err := s.dump(); err != nil {
+		s.data = saved
+		return err
+	}
+	return nil
 }
 
 func (s *CacheF) Close() {

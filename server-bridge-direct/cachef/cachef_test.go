@@ -9,7 +9,6 @@ import (
 	"testing"
 )
 
-
 func TestCachef(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "abc.txt")
 	cf, err := New(filename)
@@ -306,3 +305,74 @@ func TestUnmarshalDeduplicatesPorts(t *testing.T) {
 	}
 }
 
+func TestAddRollsBackMemoryWhenDumpFails(t *testing.T) {
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "bridge.db")
+	cf, err := New(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cf.Close)
+	if err := cf.Add(8001, "1.2.3.4:80"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Make only the next dump fail without relying on directory permission bits,
+	// which are not effective in all test environments (notably Windows).
+	cf.filename = filepath.Join(dir, "missing", "bridge.db")
+	if err := cf.Add(8002, "5.6.7.8:90"); err == nil {
+		t.Fatal("expected Add to fail when its dump directory is missing")
+	}
+	if cf.Get(8001) == nil {
+		t.Fatal("previous bridge disappeared from memory after failed Add")
+	}
+	if cf.Get(8002) != nil {
+		t.Fatal("failed Add remained in memory")
+	}
+
+	// The original file was never overwritten.
+	after, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("data file changed after failed Add: %q -> %q", before, after)
+	}
+}
+
+func TestDelRollsBackMemoryWhenDumpFails(t *testing.T) {
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "bridge.db")
+	cf, err := New(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cf.Close)
+	if err := cf.Add(8001, "1.2.3.4:80"); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cf.filename = filepath.Join(dir, "missing", "bridge.db")
+	if err := cf.Del(8001); err == nil {
+		t.Fatal("expected Del to fail when its dump directory is missing")
+	}
+	if b := cf.Get(8001); b == nil || b.ProxyAddr != "1.2.3.4:80" {
+		t.Fatalf("previous bridge not restored in memory after failed Del: %+v", b)
+	}
+
+	after, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("data file changed after failed Del: %q -> %q", before, after)
+	}
+}

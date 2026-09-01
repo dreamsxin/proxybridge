@@ -67,6 +67,74 @@ func TestE2ESocks5ViaBridge(t *testing.T) {
 	}
 }
 
+// TestE2ESameBridgePortSwitchesProxy verifies that one bridge port can be
+// retargeted between two local proxy endpoints without rebuilding its listener.
+// The delete request intentionally carries the second proxy address to ensure
+// deletion is keyed by bridgePort rather than by the target address.
+func TestE2ESameBridgePortSwitchesProxy(t *testing.T) {
+	br := startBridge(t)
+	first := startSocks5(t)
+	second := startSocks5(t)
+	bridgePort := freePort(t)
+
+	if first.port == second.port {
+		t.Fatalf("test proxies unexpectedly share port %d", first.port)
+	}
+
+	if res := br.add(t, bridgePort, first.host, first.port); res.Code != 200 {
+		t.Fatalf("add first proxy failed: %+v", res)
+	}
+	body, err := fetchViaBridge(bridgePort, 20*time.Second)
+	if err != nil {
+		t.Fatalf("request through first proxy failed: %v", err)
+	}
+	if !bytes.Contains(body, []byte(`"Ip"`)) {
+		t.Fatalf("unexpected first proxy response: %s", truncate(body, 300))
+	}
+	if got := first.connections.Load(); got != 1 {
+		t.Fatalf("first proxy saw %d connections after initial add, want 1", got)
+	}
+	if got := second.connections.Load(); got != 0 {
+		t.Fatalf("second proxy saw %d connections before switch, want 0", got)
+	}
+
+	// Same bridgePort, different local proxy address: this must retarget the
+	// existing listener so the port remains continuously available.
+	if res := br.add(t, bridgePort, second.host, second.port); res.Code != 200 {
+		t.Fatalf("switch to second proxy failed: %+v", res)
+	}
+	body, err = fetchViaBridge(bridgePort, 20*time.Second)
+	if err != nil {
+		t.Fatalf("request through switched proxy failed: %v", err)
+	}
+	if !bytes.Contains(body, []byte(`"Ip"`)) {
+		t.Fatalf("unexpected switched proxy response: %s", truncate(body, 300))
+	}
+	if got := first.connections.Load(); got != 1 {
+		t.Fatalf("first proxy saw %d connections after switch, want 1", got)
+	}
+	if got := second.connections.Load(); got != 1 {
+		t.Fatalf("second proxy saw %d connections after switch, want 1", got)
+	}
+
+	// Del only needs bridgePort. Supply the second target deliberately to
+	// prove a different proxy address does not prevent deletion.
+	res, err := br.call("/bridge/del", dto.UseBridge{
+		BridgePort: uint16(bridgePort),
+		Ip:         second.host,
+		Port:       uint16(second.port),
+	})
+	if err != nil {
+		t.Fatalf("delete switched bridge failed: %v", err)
+	}
+	if res.Code != 200 {
+		t.Fatalf("delete switched bridge returned: %+v", res)
+	}
+	if _, err := fetchViaBridge(bridgePort, 5*time.Second); err == nil {
+		t.Fatal("request succeeded after bridge deletion")
+	}
+}
+
 // TestE2EStressSocks5ViaBridge 在持续流量下反复重推同一个桥。
 //
 // 这是生产事故的最小复现：中心侧会周期性重推桥配置，如果重推会重建监听，

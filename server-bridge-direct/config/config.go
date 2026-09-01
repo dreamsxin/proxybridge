@@ -24,7 +24,6 @@ const (
 	DefaultLogMaxBackups = 10
 )
 
-
 type Config struct {
 	Mode       string `json:"mode"`       //模式
 	LogSource  bool   `json:"logSource"`  //日志是否显示代码行
@@ -96,4 +95,3 @@ func (c *Config) LogCompressEnabled() bool {
 	}
 	return *c.LogCompress
 }
-

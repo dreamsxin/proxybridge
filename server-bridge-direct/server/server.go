@@ -22,7 +22,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-
 var cf *cachef.CacheF
 
 // listenReadyTimeout 是 AddBridge 等待 bind 结果的上限。
@@ -59,7 +58,6 @@ func Start() {
 	startStatsLogger(config.Cfg.StatsInterval)
 	// 必须在起任何桥之前设置全局配额
 	InitConnLimits()
-
 
 	if config.Cfg.Mode != config.MODE_LOCAL {
 		//同步桥
@@ -178,7 +176,6 @@ func startStatsLogger(intervalSec int) {
 	}()
 }
 
-
 func AddBridge(c *gin.Context) {
 	var bridge dto.UseBridge
 	if err := decryptReq(c, &bridge); err != nil {
@@ -225,7 +222,6 @@ func AddBridge(c *gin.Context) {
 		return
 	}
 
-
 	if err := cf.Add(bridge.BridgePort, toAddr); err != nil {
 		slog.Error("AddBridge persist", "port", bridge.BridgePort, "toAddr", toAddr, "err", err)
 		rollbackHandler(bridge.BridgePort, prevAddr)
@@ -270,6 +266,10 @@ func DelBridge(c *gin.Context) {
 	defer unlock()
 
 	slog.Info("DelBridge", "clientIP", c.ClientIP(), "port", bridge.BridgePort)
+	var prevAddr string
+	if prev := cf.Get(bridge.BridgePort); prev != nil {
+		prevAddr = prev.ProxyAddr
+	}
 
 	// 先停监听再删记录。反序会在 cf.Del 失败时留下「记录已删、监听仍在转发」的状态，
 	// 那比「记录还在、监听已停」（重启后自愈，重试即可）危险得多。
@@ -280,6 +280,11 @@ func DelBridge(c *gin.Context) {
 	}
 	if err := cf.Del(bridge.BridgePort); err != nil {
 		slog.Error("DelBridge persist", "port", bridge.BridgePort, "err", err)
+		// 持久化失败时 CacheF 保留旧记录，监听也必须恢复到旧目标，
+		// 否则本次请求虽已报错，运行中的桥却会无故消失。
+		if prevAddr != "" {
+			rollbackHandler(bridge.BridgePort, prevAddr)
+		}
 		respFail(c, err)
 		return
 	}
@@ -301,7 +306,6 @@ func rollbackHandler(port uint16, prevAddr string) {
 		slog.Error("rollback restore", "port", port, "toAddr", prevAddr, "err", err)
 	}
 }
-
 
 func respFail(c *gin.Context, err error) {
 	c.JSON(http.StatusOK, dto.Res{

@@ -155,14 +155,32 @@ func (l *bridgeListener) stop() {
 		l.lmu.Lock()
 		if l.listener != nil {
 			l.listener.Close()
+			l.listener = nil
 		}
+		l.listening.Store(false)
 		l.lmu.Unlock()
 	})
 }
 
-func (l *bridgeListener) setListener(ln net.Listener) {
+// installListener 把 bind 出来的 listener 和 stop 串行化。
+// stop 可能恰好发生在 net.Listen 返回之后；如果此时不再检查 closed，
+// stop 看不到这个 listener，supervisor 就会进入永远未关闭的 Accept。
+func (l *bridgeListener) installListener(ln net.Listener) bool {
 	l.lmu.Lock()
+	defer l.lmu.Unlock()
+	if l.closed.Load() {
+		ln.Close()
+		return false
+	}
 	l.listener = ln
+	l.listening.Store(true)
+	return true
+}
+
+func (l *bridgeListener) clearListener() {
+	l.lmu.Lock()
+	l.listener = nil
+	l.listening.Store(false)
 	l.lmu.Unlock()
 }
 
@@ -401,14 +419,14 @@ func (l *bridgeListener) supervise(port uint16, fn func(conn net.Conn, toAddr st
 
 		backoff = 0
 		l.clearBindErr()
-		l.setListener(ln)
-		l.listening.Store(true)
+		if !l.installListener(ln) {
+			return
+		}
 		slog.Info("listen", "port", port, "toAddr", l.currentTarget())
 
 		acceptErr := l.acceptLoop(port, ln, fn)
 
-		l.listening.Store(false)
-		l.setListener(nil)
+		l.clearListener()
 		ln.Close()
 
 		if l.stopRequested() {

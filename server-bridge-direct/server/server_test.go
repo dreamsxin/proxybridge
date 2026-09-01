@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -526,6 +527,143 @@ func TestDelBridgeClosesActiveConns(t *testing.T) {
 	}
 }
 
+// 删除时持久化失败必须恢复原监听：接口报错后，旧桥仍应可用。
+func TestDelBridgeRestoresListenerWhenPersistFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetListeners(t)
+	t.Cleanup(func() { resetListeners(t) })
+	config.Cfg.Key = testKey
+
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "bridge.db")
+	var err error
+	cf, err = cachef.New(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cf.Close)
+
+	target := startTCPServer(t, "first")
+	bridgePort := freeTCPPort(t)
+	if resp := performAddBridge(t, dto.UseBridge{
+		BridgePort: bridgePort, Ip: target.host, Port: target.port,
+	}); resp.Code != 200 {
+		t.Fatalf("add failed: %+v", resp)
+	}
+
+	// Rename the cache directory so cf.Del's next atomic dump cannot create
+	// its temporary file. This is deterministic and works without permission
+	// assumptions on either Windows or Unix.
+	movedDir := dir + ".moved"
+	if err := os.Rename(dir, movedDir); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	t.Cleanup(func() {
+		if !restored {
+			_ = os.Rename(movedDir, dir)
+		}
+	})
+
+	resp, err := doBridgeRequest("/bridge/del", dto.UseBridge{BridgePort: bridgePort}, DelBridge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Code == 200 {
+		t.Fatalf("delete should fail when cache dump fails: %+v", resp)
+	}
+	if !strings.Contains(resp.Msg, "no such file") && !strings.Contains(resp.Msg, "cannot find") {
+		t.Logf("delete failure message: %q", resp.Msg)
+	}
+
+	if err := os.Rename(movedDir, dir); err != nil {
+		t.Fatal(err)
+	}
+	restored = true
+	waitFor(t, 2*time.Second, func() bool { return hasBridgeHandler(bridgePort) })
+	assertConsistent(t, bridgePort)
+	assertProxyResponse(t, bridgePort, "first")
+}
+
+// add 切换目标时持久化失败必须恢复旧目标，而不是留下新目标的监听。
+func TestAddBridgeRestoresPreviousTargetWhenPersistFails(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	resetListeners(t)
+	t.Cleanup(func() { resetListeners(t) })
+	config.Cfg.Key = testKey
+	dir := t.TempDir()
+	var err error
+	cf, err = cachef.New(filepath.Join(dir, "bridge.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cf.Close)
+
+	first := startTCPServer(t, "first")
+	second := startTCPServer(t, "second")
+	bridgePort := freeTCPPort(t)
+	if resp := performAddBridge(t, dto.UseBridge{
+		BridgePort: bridgePort, Ip: first.host, Port: first.port,
+	}); resp.Code != 200 {
+		t.Fatalf("initial add failed: %+v", resp)
+	}
+
+	// Hide the cache directory so the next cf.Add dump fails after the listener
+	// has been retargeted. The rollback must put both layers back to first.
+	movedDir := dir + ".moved"
+	if err := os.Rename(dir, movedDir); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	t.Cleanup(func() {
+		if !restored {
+			_ = os.Rename(movedDir, dir)
+		}
+	})
+
+	resp := performAddBridge(t, dto.UseBridge{
+		BridgePort: bridgePort, Ip: second.host, Port: second.port,
+	})
+	if resp.Code == 200 {
+		t.Fatalf("switch should fail when cache dump fails: %+v", resp)
+	}
+	if err := os.Rename(movedDir, dir); err != nil {
+		t.Fatal(err)
+	}
+	restored = true
+
+	entry := cf.Get(bridgePort)
+	if entry == nil || entry.ProxyAddr != net.JoinHostPort(first.host, formatPort(first.port)) {
+		t.Fatalf("cache target after failed switch = %+v, want first target", entry)
+	}
+	assertConsistent(t, bridgePort)
+	assertProxyResponse(t, bridgePort, "first")
+}
+
+// Set 后立即 Del 可能发生在 supervisor 完成 bind 之前；反复执行后端口必须仍可复用。
+func TestImmediateSetDeleteDoesNotLeakListener(t *testing.T) {
+	setupServerTest(t)
+	bridgePort := freeTCPPort(t)
+
+	for i := 0; i < 200; i++ {
+		if err := SetBridgeHandler(bridgePort, "127.0.0.1:1"); err != nil {
+			t.Fatalf("set #%d: %v", i, err)
+		}
+		if err := DelBridgeHandler(bridgePort); err != nil {
+			t.Fatalf("del #%d: %v", i, err)
+		}
+	}
+
+	if got := bridgeListenerCount(bridgePort); got != 0 {
+		t.Fatalf("listeners after immediate set/delete = %d, want 0", got)
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", bridgePort))
+	if err != nil {
+		t.Fatalf("port %d cannot be rebound after immediate set/delete: %v", bridgePort, err)
+	}
+	ln.Close()
+}
+
 // 超过单端口连接上限的连接应被立刻拒绝，给 fd 用量兜底
 func TestMaxConnsPerPortRejectsExcess(t *testing.T) {
 	setupServerTest(t)
@@ -784,8 +922,6 @@ func waitFor(t *testing.T, d time.Duration, cond func() bool) {
 	}
 	t.Fatalf("condition not met within %s", d)
 }
-
-
 
 func cacheEntryCount(port uint16) int {
 	n := 0
