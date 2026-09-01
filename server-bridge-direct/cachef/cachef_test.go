@@ -38,6 +38,99 @@ func TestCachef(t *testing.T) {
 
 }
 
+// Replace 拒绝空集合：远端返回空列表时不能把本地数据擦掉
+func TestReplaceRejectsEmptySet(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "bridge.db")
+	cf, err := New(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cf.Close)
+	if err := cf.Add(8001, "1.2.3.4:80"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cf.Replace(nil); err == nil {
+		t.Fatal("expected Replace(nil) to be rejected")
+	}
+	if err := cf.Replace([]Bridge{}); err == nil {
+		t.Fatal("expected Replace(empty) to be rejected")
+	}
+	if got := len(cf.All()); got != 1 {
+		t.Fatalf("have %d bridges after rejected replace, want 1", got)
+	}
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "8001,1.2.3.4:80\n"; string(content) != want {
+		t.Fatalf("data file = %q, want %q", content, want)
+	}
+}
+
+// Replace 成功时整体替换，本地多出来的端口要消失
+func TestReplaceSwapsWholeSet(t *testing.T) {
+	filename := filepath.Join(t.TempDir(), "bridge.db")
+	cf, err := New(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cf.Close)
+	if err := cf.Add(8001, "1.2.3.4:80"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cf.Replace([]Bridge{{Port: 8002, ProxyAddr: "5.6.7.8:90"}}); err != nil {
+		t.Fatal(err)
+	}
+	if cf.Get(8001) != nil {
+		t.Fatal("port 8001 should be gone after Replace")
+	}
+	if b := cf.Get(8002); b == nil || b.ProxyAddr != "5.6.7.8:90" {
+		t.Fatalf("port 8002 = %+v, want proxyAddr 5.6.7.8:90", b)
+	}
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "8002,5.6.7.8:90\n"; string(content) != want {
+		t.Fatalf("data file = %q, want %q", content, want)
+	}
+}
+
+// Replace 写盘失败必须回滚内存，否则会留下「内存已空、磁盘还是旧数据」，
+// 紧接着的 InitBridgeHandler 会一个桥都不起
+func TestReplaceRollsBackWhenDumpFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("windows 上目录权限位不生效，无法制造写失败")
+	}
+	dir := t.TempDir()
+	filename := filepath.Join(dir, "bridge.db")
+	cf, err := New(filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cf.Close)
+	if err := cf.Add(8001, "1.2.3.4:80"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+
+	if err := cf.Replace([]Bridge{{Port: 8002, ProxyAddr: "5.6.7.8:90"}}); err == nil {
+		t.Fatal("expected Replace to fail while the directory is read-only")
+	}
+	if b := cf.Get(8001); b == nil || b.ProxyAddr != "1.2.3.4:80" {
+		t.Fatalf("port 8001 = %+v, want the pre-replace value back", b)
+	}
+	if cf.Get(8002) != nil {
+		t.Fatal("failed Replace must not leave the new set in memory")
+	}
+}
+
 // 正常写入后目录里只应有数据文件本身：临时文件必须被 rename 掉或清理掉
 func TestDumpLeavesNoTempFiles(t *testing.T) {
 	dir := t.TempDir()

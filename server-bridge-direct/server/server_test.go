@@ -281,6 +281,56 @@ func TestConcurrentAddAndDelSameBridgePort(t *testing.T) {
 	assertProxyResponse(t, bridgePort, "first")
 }
 
+// 中心侧返回空列表不能把本地映射表擦掉：擦掉之后本地再没有副本可恢复
+func TestSyncBridgeRejectsEmptyRemoteList(t *testing.T) {
+	setupServerTest(t)
+	if err := cf.Add(8001, "1.2.3.4:80"); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"code":200,"msg":"ok","data":[]}`)
+	}))
+	t.Cleanup(ts.Close)
+	prev := config.Cfg.SyncDomain
+	config.Cfg.SyncDomain = ts.URL
+	t.Cleanup(func() { config.Cfg.SyncDomain = prev })
+
+	if err := syncBridge(); err == nil {
+		t.Fatal("expected an empty remote bridge list to be rejected")
+	}
+	if got := cacheEntryCount(8001); got != 1 {
+		t.Fatalf("cache entries for 8001 = %d, want 1 (local data must survive)", got)
+	}
+}
+
+// 正常同步用远端集合整体替换本地：本地多出来的记录要被移除
+func TestSyncBridgeReplacesLocalSet(t *testing.T) {
+	setupServerTest(t)
+	if err := cf.Add(8001, "1.2.3.4:80"); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"code":200,"msg":"ok","data":[{"port":8002,"proxyAddr":"5.6.7.8:90"}]}`)
+	}))
+	t.Cleanup(ts.Close)
+	prev := config.Cfg.SyncDomain
+	config.Cfg.SyncDomain = ts.URL
+	t.Cleanup(func() { config.Cfg.SyncDomain = prev })
+
+	if err := syncBridge(); err != nil {
+		t.Fatal(err)
+	}
+	if got := cacheEntryCount(8001); got != 0 {
+		t.Fatalf("cache entries for 8001 = %d, want 0 after replace", got)
+	}
+	entry := cf.Get(8002)
+	if entry == nil || entry.ProxyAddr != "5.6.7.8:90" {
+		t.Fatalf("port 8002 = %+v, want proxyAddr 5.6.7.8:90", entry)
+	}
+}
+
 // 管理接口的锁必须是端口粒度：一次慢操作（DelBridgeHandler 最坏等 stopTimeout=10s，
 // 或一次卡住的 fsync）只能堵住同端口的请求，不能把其它端口的请求排在后面
 func TestManagementLockIsPerPort(t *testing.T) {
@@ -530,7 +580,7 @@ func TestGlobalMaxConnsRejectsExcess(t *testing.T) {
 	InitConnLimits()
 	t.Cleanup(func() {
 		config.Cfg.MaxConns = prev
-		globalConnSem = nil
+		globalConnSem.Store(nil)
 	})
 
 	target := startHoldingTCPServer(t)
@@ -567,7 +617,7 @@ func TestGlobalMaxConnsRejectsExcess(t *testing.T) {
 
 	// 配额必须在连接结束时归还，否则一段时间后所有桥都会拒连
 	first.Close()
-	waitFor(t, 2*time.Second, func() bool { return len(globalConnSem) == 0 })
+	waitFor(t, 2*time.Second, func() bool { return globalConnInUse() == 0 })
 }
 
 type tcpTarget struct {

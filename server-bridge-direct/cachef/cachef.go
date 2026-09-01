@@ -244,13 +244,33 @@ func (s *CacheF) Add(port uint16, proxyAddr string) error {
 	return s.dump()
 }
 
-func (s *CacheF) BatchAdd(bridges []Bridge) error {
+// Replace 用一份新集合原子替换全部记录，用于远端同步对账。
+//
+// 拒绝空集合：中心侧返回空列表（bridgeId 配错、上游数据异常、接口改动）时
+// 不能把本地映射表擦掉——擦掉之后本地再没有副本可以恢复，所有桥直接消失。
+// 要清空请逐个走 Del。
+//
+// 写盘失败会回滚内存，避免留下「内存已空、磁盘还是旧数据」的分叉：
+// 那种状态下紧接着的 InitBridgeHandler 会一个桥都不起，而磁盘看起来完好。
+func (s *CacheF) Replace(bridges []Bridge) error {
+	if len(bridges) == 0 {
+		return errors.New("refusing to replace cache with an empty bridge set")
+	}
 	s.rwm.Lock()
 	defer s.rwm.Unlock()
-	for _, bridge := range bridges {
-		s.upsertLocked(bridge.Port, bridge.ProxyAddr)
+
+	prev := s.data
+	s.data = make([]*Bridge, 0, len(bridges))
+	for _, b := range bridges {
+		s.upsertLocked(b.Port, b.ProxyAddr)
 	}
-	return s.dump()
+	if err := s.dump(); err != nil {
+		s.data = prev
+		slog.Error("cache replace rolled back", "count", len(bridges), "err", err)
+		return err
+	}
+	slog.Info("cache replaced", "count", len(s.data))
+	return nil
 }
 
 func (s *CacheF) All() []*Bridge {
@@ -259,12 +279,6 @@ func (s *CacheF) All() []*Bridge {
 	dst := make([]*Bridge, len(s.data))
 	copy(dst, s.data)
 	return dst
-}
-
-func (s *CacheF) Clear() {
-	s.rwm.Lock()
-	defer s.rwm.Unlock()
-	s.data = make([]*Bridge, 0)
 }
 
 func (s *CacheF) Get(port uint16) *Bridge {

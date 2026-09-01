@@ -10,6 +10,7 @@ import (
 	"net/http"
 	_ "net/http/pprof" // 仅在配置了 pprofAddr 时才对外提供
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"sync"
 	"time"
@@ -74,7 +75,10 @@ func Start() {
 
 	if config.Cfg.Mode != config.MODE_LOCAL {
 		gin.SetMode(gin.ReleaseMode)
-		r := gin.Default()
+		// 不用 gin.Default()：它的访问日志和 panic 栈直接写 stdout，
+		// 既不进 logFile 也不参与轮转，排查时要和桥的日志分两处看
+		r := gin.New()
+		r.Use(accessLog(), recovery())
 		r.POST("/bridge/add", AddBridge)
 		r.POST("/bridge/del", DelBridge)
 		if config.Cfg.Addr == "" {
@@ -85,6 +89,32 @@ func Start() {
 			slog.Error("management server exited", "addr", config.Cfg.Addr, "err", err)
 		}
 	}
+}
+
+// accessLog 把管理接口的访问日志接进 slog
+func accessLog() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		started := time.Now()
+		c.Next()
+		slog.Info("management request",
+			"method", c.Request.Method,
+			"path", c.Request.URL.Path,
+			"status", c.Writer.Status(),
+			"clientIP", c.ClientIP(),
+			"latencyMs", time.Since(started).Milliseconds())
+	}
+}
+
+// recovery 兜住 handler 里的 panic：一个管理请求崩掉不该带走整个进程，
+// 同时栈要落到日志文件里而不是 stdout
+func recovery() gin.HandlerFunc {
+	return gin.CustomRecovery(func(c *gin.Context, recovered any) {
+		slog.Error("management request panic",
+			"path", c.Request.URL.Path, "clientIP", c.ClientIP(),
+			"panic", fmt.Sprint(recovered), "stack", string(debug.Stack()))
+		respFail(c, errors.New("internal error"))
+		c.Abort()
+	})
 }
 
 // startPprof 按需开启 pprof。空地址=关闭。
@@ -387,8 +417,11 @@ func syncBridge() error {
 	if res.Code != 200 {
 		return fmt.Errorf("sync bridges rejected: code=%d msg=%s", res.Code, res.Msg)
 	}
-	cf.Clear()
-	if err := cf.BatchAdd(res.Data); err != nil {
+	// Replace 会拒绝空集合并在写盘失败时回滚：
+	// 旧写法是 Clear() + BatchAdd()，中心侧返回空列表会把本地映射表擦掉，
+	// 而 BatchAdd 失败又会留下「内存已空、磁盘还是旧数据」——紧接着的
+	// InitBridgeHandler 就会一个桥都不起，而磁盘看起来完好。
+	if err := cf.Replace(res.Data); err != nil {
 		return err
 	}
 	slog.Info("syncBridge ok", "count", len(res.Data))

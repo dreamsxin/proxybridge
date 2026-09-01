@@ -28,36 +28,56 @@ const (
 
 // globalConnSem 是进程级并发连接配额，nil 表示不限制。
 // 单端口上限拦不住桥的数量，全局这道墙才是 fd 的真正兜底。
-var globalConnSem chan struct{}
+//
+// 用 atomic.Pointer 而不是裸变量：正常启动时只在起桥之前写一次，但配额一旦要
+// 在运行期重设（测试、后续的配置热加载），裸变量就是和 accept/release 路径的
+// 数据竞争——-race 能直接抓到。
+var globalConnSem atomic.Pointer[chan struct{}]
 
 // InitConnLimits 必须在起任何桥之前调用一次
 func InitConnLimits() {
 	if n := config.Cfg.MaxConns; n > 0 {
-		globalConnSem = make(chan struct{}, n)
+		sem := make(chan struct{}, n)
+		globalConnSem.Store(&sem)
 		slog.Info("global connection limit enabled", "maxConns", n)
+		return
 	}
+	globalConnSem.Store(nil)
 }
 
 func acquireGlobalConn() bool {
-	if globalConnSem == nil {
+	sem := globalConnSem.Load()
+	if sem == nil {
 		return true
 	}
 	select {
-	case globalConnSem <- struct{}{}:
+	case *sem <- struct{}{}:
 		return true
 	default:
 		return false
 	}
 }
 
+// releaseGlobalConn 归还配额。配额若在连接存活期间被换过一次，这里归还的是
+// 新配额的位置——只会让上限短暂偏松一个连接，不会卡死，可以接受。
 func releaseGlobalConn() {
-	if globalConnSem == nil {
+	sem := globalConnSem.Load()
+	if sem == nil {
 		return
 	}
 	select {
-	case <-globalConnSem:
+	case <-*sem:
 	default:
 	}
+}
+
+// globalConnInUse 返回已占用的全局配额，仅用于观测
+func globalConnInUse() int {
+	sem := globalConnSem.Load()
+	if sem == nil {
+		return 0
+	}
+	return len(*sem)
 }
 
 type bridgeListener struct {
