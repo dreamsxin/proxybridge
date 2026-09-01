@@ -197,13 +197,17 @@ func AddBridge(c *gin.Context) {
 	defer unlock()
 
 	toAddr := net.JoinHostPort(bridge.Ip, strconv.FormatUint(uint64(bridge.Port), 10))
-	slog.Info("AddBridge", "clientIP", c.ClientIP(), "port", bridge.BridgePort, "toAddr", toAddr)
 
 	// 记录回滚目标：持久化失败时要恢复成数据文件里描述的状态
 	var prevAddr string
 	if prev := cf.Get(bridge.BridgePort); prev != nil {
 		prevAddr = prev.ProxyAddr
 	}
+
+	// prevAddr 是数据文件里的旧目标，和桥层 "SetBridgeHandler retarget" 日志里的
+	// from（实际监听正在用的目标）对照，能直接看出缓存与监听是否分叉
+	slog.Info("AddBridge", "clientIP", c.ClientIP(), "port", bridge.BridgePort,
+		"prevAddr", prevAddr, "toAddr", toAddr)
 
 	// 目标未变且监听在跑：什么都不做，省掉一次全量重写数据文件+fsync。
 	// 注意这里必须同时检查监听是否真的存在：只看缓存会在
