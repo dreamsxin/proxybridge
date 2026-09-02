@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"syscall"
 
-
 	"github.com/baowk/bridge-direct/config"
 	"github.com/baowk/bridge-direct/server"
 	"github.com/spf13/viper"
