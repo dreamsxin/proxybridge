@@ -135,6 +135,77 @@ func TestE2ESameBridgePortSwitchesProxy(t *testing.T) {
 	}
 }
 
+// TestE2EUnreachableRetargetKeepsBridgeListening repeatedly retargets one
+// bridge port to local endpoints with no listener. Requests must fail because
+// the backend proxy is unavailable, but the bridge port itself must continue
+// accepting TCP connections. The final switch to a working proxy verifies that
+// a failed backend does not poison the listener or prevent recovery.
+func TestE2EUnreachableRetargetKeepsBridgeListening(t *testing.T) {
+	retargets := envInt("E2E_BAD_RETARGETS", 30)
+	br := startBridge(t)
+	good := startSocks5(t)
+	bridgePort := freePort(t)
+	bridgeAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(bridgePort))
+
+	if res := br.add(t, bridgePort, good.host, good.port); res.Code != 200 {
+		t.Fatalf("add initial proxy failed: %+v", res)
+	}
+
+	badPorts := make([]int, retargets)
+	for i := range badPorts {
+		port := freePort(t)
+		for port == bridgePort {
+			port = freePort(t)
+		}
+		badPorts[i] = port
+	}
+
+	for i, badPort := range badPorts {
+		res, err := br.callAdd(bridgePort, "127.0.0.1", badPort)
+		if err != nil {
+			t.Fatalf("retarget #%d/%d API call failed: %v", i+1, retargets, err)
+		}
+		if res.Code != 200 {
+			t.Fatalf("retarget #%d/%d returned: %+v", i+1, retargets, res)
+		}
+
+		// A backend failure is expected, but a listener failure is not.
+		conn, err := net.DialTimeout("tcp", bridgeAddr, time.Second)
+		if err != nil {
+			t.Fatalf("bridge port refused after retarget #%d/%d to bad proxy 127.0.0.1:%d: %v", i+1, retargets, badPort, err)
+		}
+		conn.Close()
+
+		if _, err := fetchViaBridge(bridgePort, 3*time.Second); err == nil {
+			t.Fatalf("request unexpectedly succeeded through unreachable proxy at retarget #%d/%d", i+1, retargets)
+		} else if isRefused(err) {
+			t.Fatalf("bridge listener was refused after retarget #%d/%d: %v", i+1, retargets, err)
+		}
+	}
+
+	// Recovery check: changing back to a working backend must restore traffic
+	// on the same listener after all failed backend attempts.
+	if res := br.add(t, bridgePort, good.host, good.port); res.Code != 200 {
+		t.Fatalf("restore working proxy failed: %+v", res)
+	}
+	body, err := fetchViaBridge(bridgePort, 20*time.Second)
+	if err != nil {
+		t.Fatalf("request after restoring working proxy failed: %v", err)
+	}
+	if !bytes.Contains(body, []byte(`"Ip"`)) {
+		t.Fatalf("unexpected response after restoring working proxy: %s", truncate(body, 300))
+	}
+
+	if res, err := br.call("/bridge/del", dto.UseBridge{BridgePort: uint16(bridgePort)}); err != nil {
+		t.Fatalf("delete after unreachable retargets failed: %v", err)
+	} else if res.Code != 200 {
+		t.Fatalf("delete after unreachable retargets returned: %+v", res)
+	}
+	if portStillAccepting(bridgeAddr, 3*time.Second) {
+		t.Fatalf("bridge port %d still accepts connections after final delete", bridgePort)
+	}
+}
+
 // TestE2EStressSocks5ViaBridge 在持续流量下反复重推同一个桥。
 //
 // 这是生产事故的最小复现：中心侧会周期性重推桥配置，如果重推会重建监听，

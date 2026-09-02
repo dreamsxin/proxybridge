@@ -15,12 +15,12 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-const VERSION = "v0.0.5+20260609"
+const VERSION = "v0.0.6+20260901"
 const MYIP_URL = "http://api.ipipv.com"
 
 var (
-	BuildTime = "unknown"
-	GitCommit = "unknown"
+	BuildTime = "20260902"
+	GitCommit = "de3a2f4"
 )
 
 func init() {
