@@ -7,7 +7,10 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime/debug"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/baowk/bridge-direct/config"
 	"github.com/baowk/bridge-direct/server"
@@ -16,19 +19,23 @@ import (
 )
 
 const VERSION = "v0.0.6+20260901"
+
 const MYIP_URL = "http://api.ipipv.com"
 
 var (
-	BuildTime = "20260902"
-	GitCommit = "de3a2f4"
+	// 正式构建由 build.ps1/build.sh 通过 -ldflags 注入；go run 时由
+	// initBuildMetadata 从 build info 和当前时间补齐，避免手工维护过期值。
+	BuildTime = "unknown"
+	GitCommit = "unknown"
 )
 
 func init() {
 	flag.StringVar(&config.CfgFile, "c", "config.json", "配置文件: -c config.json")
-	flag.Parse()
 }
 
 func main() {
+	flag.Parse()
+	initBuildMetadata()
 	if flag.NArg() > 0 && flag.Arg(0) == "version" {
 		printVersion()
 		return
@@ -71,6 +78,46 @@ func main() {
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	sig := <-quit
 	slog.Info("bridge-direct shutting down", "signal", sig.String())
+}
+
+// initBuildMetadata 只填充未被 linker 注入的值。正式构建的元数据优先级最高，
+// go run/普通 go build 则使用 Go 的 VCS build info 和当前 UTC 时间。
+func initBuildMetadata() {
+	BuildTime, GitCommit = resolveBuildMetadata(BuildTime, GitCommit, time.Now().UTC(), nil)
+}
+
+func resolveBuildMetadata(buildTime, gitCommit string, now time.Time, info *debug.BuildInfo) (string, string) {
+	if buildTime == "" || buildTime == "unknown" {
+		buildTime = now.UTC().Format(time.RFC3339)
+	}
+	if gitCommit == "" || gitCommit == "unknown" {
+		if info == nil {
+			if current, ok := debug.ReadBuildInfo(); ok {
+				info = current
+			}
+		}
+		if info != nil {
+			for _, setting := range info.Settings {
+				if setting.Key != "vcs.revision" || setting.Value == "" {
+					continue
+				}
+				gitCommit = shortGitCommit(setting.Value)
+				break
+			}
+		}
+	}
+	if gitCommit == "" {
+		gitCommit = "unknown"
+	}
+	return buildTime, gitCommit
+}
+
+func shortGitCommit(commit string) string {
+	commit = strings.TrimSpace(commit)
+	if len(commit) > 7 {
+		return commit[:7]
+	}
+	return commit
 }
 
 func printVersion() {

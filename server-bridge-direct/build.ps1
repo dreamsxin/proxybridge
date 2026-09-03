@@ -6,7 +6,20 @@ $origGOARCH = $env:GOARCH
 
 try {
     $buildTime = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $gitCommit = (git rev-parse --short HEAD).Trim()
+    # BuildTime 始终由脚本生成；Git 不存在或当前目录不是仓库时不阻断构建
+    $gitCommit = "unknown"
+    $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+    if ($null -ne $gitCommand) {
+        try {
+            $candidate = (& $gitCommand.Source rev-parse --short HEAD 2>$null).Trim()
+            if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+                $gitCommit = $candidate
+            }
+        }
+        catch {
+            $gitCommit = "unknown"
+        }
+    }
     $ldflags = "-w -s -X main.BuildTime=$buildTime -X main.GitCommit=$gitCommit"
 
     New-Item -ItemType Directory -Force -Path "bin" | Out-Null
