@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof" // 仅在配置了 pprofAddr 时才对外提供
-	"runtime"
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -149,23 +148,7 @@ func startPprof(addr string) {
 	}()
 }
 
-// startStatsLogger 定期输出运行水位，用于判断 goroutine/连接/内存是否在单调增长。
-//
-// 进程层字段的口径：
-//   - goroutines：协程总数。构成是「固定基线（http server、pprof、ticker 等十几个）
-//     + 每个桥 1 个 supervisor（accept 循环跑在它里面）+ 每条活跃连接 2 个
-//     （handlerBridge 本身，加上它派生的上行拷贝协程）」。
-//     所以大致有 goroutines ≈ 基线 + bridges + 2×conns；
-//     conns 不涨而 goroutines 一直涨，就是协程泄漏。
-//   - heapAllocMB：存活对象占用的堆。判断泄漏看它在多次采样间是否单调上升，
-//     正常应在 GC 之间锯齿波动、峰值稳定。
-//   - sysMB：向操作系统申请的总内存（含协程栈、runtime 元数据、已释放但未归还
-//     给 OS 的部分）。比 heapAllocMB 大很多是正常的，不要用它判断泄漏；
-//     但它是 RSS 的近似上界，容器内存限额要按它看。
-//   - numGC：累计 GC 次数。本身不重要，两次采样之间的增量变大说明分配速率上升
-//     （通常是连接数或流量涨了）。
-//
-// 桥相关字段的含义见 BridgeStats 的注释，尤其是「桥被删除后累计计数会变小」这条口径。
+// startStatsLogger 定期输出运行水位，用于判断 goroutine/连接/内存是否在单调增长
 func startStatsLogger(intervalSec int) {
 	if intervalSec <= 0 {
 		return
@@ -175,23 +158,21 @@ func startStatsLogger(intervalSec int) {
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for range t.C {
-			bs := CollectBridgeStats()
-			var ms runtime.MemStats
-			runtime.ReadMemStats(&ms)
+			stats := CollectRuntimeStats()
 			slog.Info("stats",
-				"goroutines", runtime.NumGoroutine(),
-				"bridges", bs.Bridges,
+				"goroutines", stats.Goroutines,
+				"bridges", stats.Bridges,
 				// listening < bridges 说明有桥卡在 bind 重试上
-				"listening", bs.Listening,
-				"conns", bs.Conns,
-				"accepted", bs.Accepted,
+				"listening", stats.Listening,
+				"conns", stats.Conns,
+				"accepted", stats.Accepted,
 				// rejected 增长说明撞到了并发上限
-				"rejected", bs.Rejected,
-				"dialOK", bs.DialOK,
-				"dialFail", bs.DialFail,
-				"heapAllocMB", ms.HeapAlloc>>20,
-				"sysMB", ms.Sys>>20,
-				"numGC", ms.NumGC)
+				"rejected", stats.Rejected,
+				"dialOK", stats.DialOK,
+				"dialFail", stats.DialFail,
+				"heapAllocMB", stats.HeapAllocMB,
+				"sysMB", stats.SysMB,
+				"numGC", stats.NumGC)
 		}
 	}()
 }

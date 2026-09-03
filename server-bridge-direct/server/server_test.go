@@ -72,14 +72,18 @@ func TestGetBridgeStatusReportsHealthyRuntime(t *testing.T) {
 	c.Request = req
 	GetBridgeStatus(c)
 	var resp struct {
-		Code int                `json:"code"`
-		Data []dto.BridgeStatus `json:"data"`
+		Code  int                `json:"code"`
+		Data  []dto.BridgeStatus `json:"data"`
+		Stats RuntimeStats       `json:"stats"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("response %q: %v", rec.Body.String(), err)
 	}
 	if resp.Code != 200 || len(resp.Data) != 1 || !resp.Data[0].OK {
 		t.Fatalf("unexpected status response: %+v", resp)
+	}
+	if resp.Stats.Bridges < 1 || resp.Stats.Listening < 1 || resp.Stats.Goroutines < 1 {
+		t.Fatalf("status response stats = %+v, want active bridge and goroutine counts", resp.Stats)
 	}
 }
 

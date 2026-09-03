@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -33,7 +34,56 @@ func GetBridgeStatus(c *gin.Context) {
 	}
 	check := c.Query("check") == "1" || strings.EqualFold(c.Query("check"), "true")
 	data := RuntimeBridgeStatus(bridgePort, c.Query("proxyAddr"), check)
-	respOKData(c, data)
+	c.JSON(http.StatusOK, bridgeStatusResponse{
+		Code:  http.StatusOK,
+		Msg:   "ok",
+		Data:  data,
+		Stats: CollectRuntimeStats(),
+	})
+}
+
+// bridgeStatusResponse 保持原有 data 数组格式，在顶层补充 startStatsLogger
+// 使用的进程/桥统计。已有客户端只读取 data 时不受影响。
+type bridgeStatusResponse struct {
+	Code  int                `json:"code"`
+	Msg   string             `json:"msg"`
+	Data  []dto.BridgeStatus `json:"data"`
+	Stats RuntimeStats       `json:"stats"`
+}
+
+// RuntimeStats 是 startStatsLogger 和 /bridge/status 共享的统计快照。
+type RuntimeStats struct {
+	Goroutines  int    `json:"goroutines"`
+	Bridges     int    `json:"bridges"`
+	Listening   int    `json:"listening"`
+	Conns       int    `json:"conns"`
+	Accepted    int64  `json:"accepted"`
+	Rejected    int64  `json:"rejected"`
+	DialOK      int64  `json:"dialOK"`
+	DialFail    int64  `json:"dialFail"`
+	HeapAllocMB uint64 `json:"heapAllocMB"`
+	SysMB       uint64 `json:"sysMB"`
+	NumGC       uint32 `json:"numGC"`
+}
+
+// CollectRuntimeStats 采集与 startStatsLogger 相同的运行水位。
+func CollectRuntimeStats() RuntimeStats {
+	bridgeStats := CollectBridgeStats()
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	return RuntimeStats{
+		Goroutines:  runtime.NumGoroutine(),
+		Bridges:     bridgeStats.Bridges,
+		Listening:   bridgeStats.Listening,
+		Conns:       bridgeStats.Conns,
+		Accepted:    bridgeStats.Accepted,
+		Rejected:    bridgeStats.Rejected,
+		DialOK:      bridgeStats.DialOK,
+		DialFail:    bridgeStats.DialFail,
+		HeapAllocMB: memStats.HeapAlloc >> 20,
+		SysMB:       memStats.Sys >> 20,
+		NumGC:       memStats.NumGC,
+	}
 }
 
 // StartBridge 从 bridge.db 中恢复一个已有桥的运行态监听。
