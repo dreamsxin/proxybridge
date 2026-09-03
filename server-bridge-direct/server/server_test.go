@@ -47,6 +47,173 @@ func TestAddBridgeUpdatesExistingBridgePort(t *testing.T) {
 	assertProxyResponse(t, bridgePort, "second")
 }
 
+func TestGetBridgeStatusReportsHealthyRuntime(t *testing.T) {
+	setupServerTest(t)
+	target := startTCPServer(t, "status")
+	bridgePort := freeTCPPort(t)
+	proxyAddr := net.JoinHostPort(target.host, formatPort(target.port))
+	if resp := performAddBridge(t, dto.UseBridge{BridgePort: bridgePort, Ip: target.host, Port: target.port}); resp.Code != 200 {
+		t.Fatalf("add failed: %+v", resp)
+	}
+
+	statuses := RuntimeBridgeStatus(bridgePort, proxyAddr, true)
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %+v, want one result", statuses)
+	}
+	status := statuses[0]
+	if status.BridgePort != bridgePort || status.ProxyAddr != proxyAddr || !status.Listening || !status.BridgeTCP || !status.ProxyTCP || !status.OK {
+		t.Fatalf("unhealthy runtime status: %+v", status)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/bridge/status?bridgePort="+formatPort(bridgePort)+"&check=1", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+	GetBridgeStatus(c)
+	var resp struct {
+		Code int                `json:"code"`
+		Data []dto.BridgeStatus `json:"data"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response %q: %v", rec.Body.String(), err)
+	}
+	if resp.Code != 200 || len(resp.Data) != 1 || !resp.Data[0].OK {
+		t.Fatalf("unexpected status response: %+v", resp)
+	}
+}
+
+func TestGetBridgeStatusIncludesConfiguredMissingListener(t *testing.T) {
+	setupServerTest(t)
+	target := startTCPServer(t, "configured")
+	bridgePort := freeTCPPort(t)
+	proxyAddr := net.JoinHostPort(target.host, formatPort(target.port))
+	if err := cf.Add(bridgePort, proxyAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	statuses := RuntimeBridgeStatus(bridgePort, "", false)
+	if len(statuses) != 1 || statuses[0].Listening || statuses[0].OK {
+		t.Fatalf("missing-listener status = %+v", statuses)
+	}
+	if !strings.Contains(statuses[0].FailureReason, "监听器") {
+		t.Fatalf("missing-listener reason = %q", statuses[0].FailureReason)
+	}
+}
+
+func TestBridgeStatusAndStartRejectNonLoopback(t *testing.T) {
+	setupServerTest(t)
+	for name, test := range map[string]struct {
+		handler gin.HandlerFunc
+		method  string
+		path    string
+	}{
+		"status": {GetBridgeStatus, http.MethodGet, "/bridge/status"},
+		"start":  {StartBridge, http.MethodPost, "/bridge/start?bridgePort=12345"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := httptest.NewRequest(test.method, test.path, nil)
+			req.RemoteAddr = "192.0.2.1:12345"
+			rec := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(rec)
+			c.Request = req
+			test.handler(c)
+			var resp dto.Res
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("response %q: %v", rec.Body.String(), err)
+			}
+			if resp.Code != http.StatusForbidden {
+				t.Fatalf("response = %+v, want code %d", resp, http.StatusForbidden)
+			}
+		})
+	}
+}
+
+func TestStartBridgeRestoresConfiguredListener(t *testing.T) {
+	setupServerTest(t)
+	target := startTCPServer(t, "started")
+	bridgePort := freeTCPPort(t)
+	proxyAddr := net.JoinHostPort(target.host, formatPort(target.port))
+	if err := cf.Add(bridgePort, proxyAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	first, firstResult := performStartBridgeRequest(t, "127.0.0.1:12345", bridgePort)
+	if first.Code != 200 {
+		t.Fatalf("start response = %+v", first)
+	}
+	if firstResult.Status != "started" {
+		t.Fatalf("first start result = %+v", firstResult)
+	}
+	assertProxyResponse(t, bridgePort, "started")
+
+	second, secondResult := performStartBridgeRequest(t, "127.0.0.1:12345", bridgePort)
+	if second.Code != 200 {
+		t.Fatalf("repeat start response = %+v", second)
+	}
+	if secondResult.Status != "alreadyListening" {
+		t.Fatalf("repeat start result = %+v", secondResult)
+	}
+}
+
+func TestStartBridgeReportsTargetConflict(t *testing.T) {
+	setupServerTest(t)
+	configuredTarget := startTCPServer(t, "configured")
+	runtimeTarget := startTCPServer(t, "runtime")
+	bridgePort := freeTCPPort(t)
+	configuredAddr := net.JoinHostPort(configuredTarget.host, formatPort(configuredTarget.port))
+	runtimeAddr := net.JoinHostPort(runtimeTarget.host, formatPort(runtimeTarget.port))
+	if err := cf.Add(bridgePort, configuredAddr); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetBridgeHandler(bridgePort, runtimeAddr); err != nil {
+		t.Fatal(err)
+	}
+	if ready, bindErr := WaitBridgeListening(bridgePort, 2*time.Second); !ready {
+		t.Fatalf("runtime listener not ready: %s", bindErr)
+	}
+
+	resp, result := performStartBridgeRequest(t, "127.0.0.1:12345", bridgePort)
+	if resp.Code == 200 || result.Status != "conflict" {
+		t.Fatalf("conflict response=%+v result=%+v", resp, result)
+	}
+	assertProxyResponse(t, bridgePort, "runtime")
+}
+
+func TestStartBridgeReportsBindFailureAndKeepsRetrying(t *testing.T) {
+	setupServerTest(t)
+	target := startTCPServer(t, "recovered")
+	blocker, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			blocker.Close()
+		}
+	}()
+	bridgePort := portOf(t, blocker.Addr())
+	proxyAddr := net.JoinHostPort(target.host, formatPort(target.port))
+	if err := cf.Add(bridgePort, proxyAddr); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, result := performStartBridgeRequest(t, "127.0.0.1:12345", bridgePort)
+	if resp.Code == 200 || result.Status != "failed" || !result.Retrying || result.Err == "" {
+		t.Fatalf("bind failure response=%+v result=%+v", resp, result)
+	}
+	statuses := RuntimeBridgeStatus(bridgePort, "", false)
+	if len(statuses) != 1 || statuses[0].Listening || statuses[0].BindErr == "" {
+		t.Fatalf("bind-retry status = %+v", statuses)
+	}
+
+	blocker.Close()
+	closed = true
+	waitFor(t, 15*time.Second, func() bool { return hasBridgeHandler(bridgePort) })
+	assertProxyResponse(t, bridgePort, "recovered")
+}
+
 func TestAddBridgeRejectsInvalidIP(t *testing.T) {
 	setupServerTest(t)
 
@@ -886,6 +1053,32 @@ func performAddBridge(t *testing.T, bridge dto.UseBridge) dto.Res {
 		t.Fatal(err)
 	}
 	return resp
+}
+
+func performStartBridgeRequest(t *testing.T, remoteAddr string, bridgePort uint16) (dto.Res, dto.BridgeStartResult) {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/bridge/start?bridgePort="+formatPort(bridgePort), nil)
+	req.RemoteAddr = remoteAddr
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = req
+	StartBridge(c)
+
+	var resp dto.Res
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("response %q: %v", rec.Body.String(), err)
+	}
+	var result dto.BridgeStartResult
+	if resp.Data != nil {
+		data, err := json.Marshal(resp.Data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return resp, result
 }
 
 func bridgeListenerCount(port uint16) int {

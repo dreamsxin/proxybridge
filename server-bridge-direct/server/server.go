@@ -62,8 +62,10 @@ func Start() {
 	if config.Cfg.Mode != config.MODE_LOCAL {
 		//同步桥
 		if err := syncBridge(); err != nil {
-			slog.Error("syncBridge", "syncDomain", config.Cfg.SyncDomain,
-				"bridgeId", config.Cfg.BridgeId, "err", err)
+			// syncBridge 已经记录了完整失败上下文；这里保留一条简短状态日志，
+			// 明确说明服务将继续使用本地缓存启动。
+			slog.Warn("syncBridge failed; using local cache", "syncDomain", config.Cfg.SyncDomain,
+				"bridgeId", config.Cfg.BridgeId)
 		}
 	} else {
 		slog.Info("local mode: skip syncBridge and management api", "mode", config.Cfg.Mode)
@@ -77,6 +79,8 @@ func Start() {
 		// 既不进 logFile 也不参与轮转，排查时要和桥的日志分两处看
 		r := gin.New()
 		r.Use(accessLog(), recovery())
+		r.GET("/bridge/status", GetBridgeStatus)
+		r.POST("/bridge/start", StartBridge)
 		r.POST("/bridge/add", AddBridge)
 		r.POST("/bridge/del", DelBridge)
 		if config.Cfg.Addr == "" {
@@ -145,7 +149,23 @@ func startPprof(addr string) {
 	}()
 }
 
-// startStatsLogger 定期输出运行水位，用于判断 goroutine/连接/内存是否在单调增长
+// startStatsLogger 定期输出运行水位，用于判断 goroutine/连接/内存是否在单调增长。
+//
+// 进程层字段的口径：
+//   - goroutines：协程总数。构成是「固定基线（http server、pprof、ticker 等十几个）
+//     + 每个桥 1 个 supervisor（accept 循环跑在它里面）+ 每条活跃连接 2 个
+//     （handlerBridge 本身，加上它派生的上行拷贝协程）」。
+//     所以大致有 goroutines ≈ 基线 + bridges + 2×conns；
+//     conns 不涨而 goroutines 一直涨，就是协程泄漏。
+//   - heapAllocMB：存活对象占用的堆。判断泄漏看它在多次采样间是否单调上升，
+//     正常应在 GC 之间锯齿波动、峰值稳定。
+//   - sysMB：向操作系统申请的总内存（含协程栈、runtime 元数据、已释放但未归还
+//     给 OS 的部分）。比 heapAllocMB 大很多是正常的，不要用它判断泄漏；
+//     但它是 RSS 的近似上界，容器内存限额要按它看。
+//   - numGC：累计 GC 次数。本身不重要，两次采样之间的增量变大说明分配速率上升
+//     （通常是连接数或流量涨了）。
+//
+// 桥相关字段的含义见 BridgeStats 的注释，尤其是「桥被删除后累计计数会变小」这条口径。
 func startStatsLogger(intervalSec int) {
 	if intervalSec <= 0 {
 		return
@@ -403,7 +423,19 @@ func portFromAddr(addr string) (uint16, bool) {
 	return uint16(p), true
 }
 
-func syncBridge() error {
+func syncBridge() (err error) {
+	started := time.Now()
+	slog.Info("syncBridge start", "syncDomain", config.Cfg.SyncDomain, "bridgeId", config.Cfg.BridgeId)
+	defer func() {
+		if err != nil {
+			var netErr net.Error
+			timedOut := errors.As(err, &netErr) && netErr.Timeout()
+			slog.Error("syncBridge failed", "syncDomain", config.Cfg.SyncDomain,
+				"bridgeId", config.Cfg.BridgeId, "elapsedMs", time.Since(started).Milliseconds(),
+				"timeout", timedOut, "err", err)
+		}
+	}()
+
 	b := dto.GetBridgesReq{
 		BridgeId: config.Cfg.BridgeId,
 	}
@@ -432,6 +464,6 @@ func syncBridge() error {
 	if err := cf.Replace(res.Data); err != nil {
 		return err
 	}
-	slog.Info("syncBridge ok", "count", len(res.Data))
+	slog.Info("syncBridge ok", "count", len(res.Data), "elapsedMs", time.Since(started).Milliseconds())
 	return nil
 }

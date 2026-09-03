@@ -33,6 +33,9 @@ func main() {
 		printVersion()
 		return
 	}
+	// 版本信息始终输出到 stdout，不受 logFile/logConsole 配置影响，
+	// 便于在服务启动时直接确认运行的构建是否为最新版本。
+	fmt.Printf("bridge-direct startup version=%s build_time=%s git_commit=%s\n", VERSION, BuildTime, GitCommit)
 
 	if config.CfgFile == "" {
 		panic("找不到配置文件")

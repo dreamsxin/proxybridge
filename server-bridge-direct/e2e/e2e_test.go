@@ -206,6 +206,55 @@ func TestE2EUnreachableRetargetKeepsBridgeListening(t *testing.T) {
 	}
 }
 
+// TestE2EInfoLogsWrittenToFileWithoutConsole verifies that INFO lifecycle and
+// sync logs are persisted when console output is disabled.
+func TestE2EInfoLogsWrittenToFileWithoutConsole(t *testing.T) {
+	syncPort := freePort(t)
+	targetPort := freePort(t)
+	targetAddr := net.JoinHostPort("127.0.0.1", strconv.Itoa(targetPort))
+	syncBody := fmt.Sprintf(`{"code":200,"msg":"ok","data":[{"port":%d,"proxyAddr":"%s"}]}`,
+		syncPort, targetAddr)
+	logFile := filepath.Join(t.TempDir(), "bridge.log")
+	br := startBridgeWithOptions(t, logFile, false, syncBody)
+
+	// The synchronized bridge is already present. Re-adding it exercises the
+	// management INFO logs without changing the synchronized target.
+	if res := br.add(t, syncPort, "127.0.0.1", targetPort); res.Code != 200 {
+		t.Fatalf("add synchronized bridge failed: %+v", res)
+	}
+	if res, err := br.call("/bridge/del", dto.UseBridge{BridgePort: uint16(syncPort)}); err != nil {
+		t.Fatalf("delete synchronized bridge failed: %v", err)
+	} else if res.Code != 200 {
+		t.Fatalf("delete synchronized bridge returned: %+v", res)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	var content []byte
+	for time.Now().Before(deadline) {
+		content, _ = os.ReadFile(logFile)
+		text := string(content)
+		if strings.Contains(text, "syncBridge ok") &&
+			(strings.Contains(text, "AddBridge ok") || strings.Contains(text, "AddBridge unchanged")) &&
+			strings.Contains(text, "DelBridge ok") &&
+			strings.Contains(text, "management request") {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	text := string(content)
+	for _, event := range []string{"syncBridge ok", "DelBridge ok", "management request"} {
+		if !strings.Contains(text, event) {
+			t.Errorf("log file %s is missing INFO event %q; content:\n%s", logFile, event, text)
+		}
+	}
+	if !strings.Contains(text, "AddBridge ok") && !strings.Contains(text, "AddBridge unchanged") {
+		t.Errorf("log file %s is missing an AddBridge INFO event; content:\n%s", logFile, text)
+	}
+	if stdout := br.logs.String(); strings.Contains(stdout, "AddBridge") || strings.Contains(stdout, "DelBridge") || strings.Contains(stdout, "syncBridge") {
+		t.Fatalf("INFO lifecycle logs leaked to console despite logConsole=false:\n%s", stdout)
+	}
+}
+
 // TestE2EStressSocks5ViaBridge 在持续流量下反复重推同一个桥。
 //
 // 这是生产事故的最小复现：中心侧会周期性重推桥配置，如果重推会重建监听，
@@ -678,6 +727,10 @@ type bridgeProc struct {
 }
 
 func startBridge(t *testing.T) *bridgeProc {
+	return startBridgeWithOptions(t, "", false, `{"code":200,"msg":"ok","data":[]}`)
+}
+
+func startBridgeWithOptions(t *testing.T, logFile string, logConsole bool, syncBody string) *bridgeProc {
 	t.Helper()
 
 	bin := os.Getenv("BRIDGE_BIN")
@@ -691,7 +744,7 @@ func startBridge(t *testing.T) *bridgeProc {
 	// 桩掉中心侧：mode 必须非 local 才会起管理接口，而非 local 会先同步桥列表
 	sync := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"code":200,"msg":"ok","data":[]}`)
+		io.WriteString(w, syncBody)
 	}))
 	t.Cleanup(sync.Close)
 
@@ -701,7 +754,8 @@ func startBridge(t *testing.T) *bridgeProc {
 	cfg := map[string]any{
 		"mode":         "remote",
 		"addr":         fmt.Sprintf("127.0.0.1:%d", adminPort),
-		"logFile":      "", // 直接打到 stdout，测试失败时一起打印
+		"logFile":      logFile,
+		"logConsole":   logConsole,
 		"logLevel":     "info",
 		"logFormat":    "text",
 		"logSource":    false,

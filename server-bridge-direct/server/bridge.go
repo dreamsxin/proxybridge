@@ -315,15 +315,31 @@ func WaitBridgeListening(port uint16, timeout time.Duration) (bool, string) {
 	}
 }
 
-// BridgeStats 返回运行水位，用于判断是否存在泄漏
+// BridgeStats 是所有桥的运行水位汇总，用于判断是否存在泄漏、是否撞到上限。
+//
+// 注意四个累计计数器的口径：它们存在每个 bridgeListener 上，桥一被删除，
+// 计数就随对象消失。所以相邻两次采样之间这些值可能变小——不是数据错了，
+// 是有桥下线了。做趋势或告警时只取正增量，别当成单调递增的计数器。
 type BridgeStats struct {
-	Bridges   int
+	// Bridges 当前被接管的桥数量，含正在 bind 重试、还没监听成功的
+	Bridges int
+	// Listening 其中真正在监听的数量。
+	// Listening < Bridges 说明有桥卡在 bind 重试上（端口被占、fd 耗尽），
+	// 这些桥记录在但完全不通，是最该配告警的一项
 	Listening int
-	Conns     int
-	Accepted  int64
-	Rejected  int64
-	DialOK    int64
-	DialFail  int64
+	// Conns 当前活跃连接数。SOCKS5 场景下浏览器保持连接池，稳态有基数是正常的；
+	// 配了 MaxConns/MaxConnsPerPort 时用它看距离上限还有多少余量
+	Conns int
+	// Accepted 累计接受的连接数
+	Accepted int64
+	// Rejected 因撞并发上限而被立即关掉的连接数（全局或单端口）。
+	// 只要在涨就说明在丢连接；上限配 0 时恒为 0
+	Rejected int64
+	// DialOK/DialFail 向目标拨号的成功/失败次数。
+	// DialFail 增长意味着目标不可达或超时(dialTimeout)，与 "dial target" 错误日志对应。
+	// 大致守恒：Accepted ≈ Rejected + DialOK + DialFail + 正在拨号中
+	DialOK   int64
+	DialFail int64
 }
 
 func CollectBridgeStats() BridgeStats {
