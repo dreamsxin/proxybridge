@@ -367,13 +367,24 @@ def main() -> int:
 
     results.sort(key=lambda item: (item.index, item.attempt))
     counts: dict[str, int] = {}
+    failure_reasons: dict[tuple[str, str], int] = {}
     for result in results:
         counts[result.category] = counts.get(result.category, 0) + 1
+        if result.status != "success" and result.message:
+            reason = " ".join(result.message.split())
+            key = (result.category, reason)
+            failure_reasons[key] = failure_reasons.get(key, 0) + 1
     summary = " ".join(f"{category}={counts[category]}" for category in sorted(counts))
     print(
         f"proxy-check summary proxies={len(values)} requestsPerProxy={args.requests_per_proxy} "
         f"total={len(results)} {summary}"
     )
+    if failure_reasons:
+        print("proxy-check failure reasons:")
+        for (category, reason), count in sorted(
+            failure_reasons.items(), key=lambda item: (-item[1], item[0][0], item[0][1])
+        ):
+            print(f"  category={category} count={count} reason={reason}")
     if args.report:
         write_report(args.report, results, args.url, args.timeout, args.concurrency, args.requests_per_proxy)
         print(f"proxy-check report={args.report}")
