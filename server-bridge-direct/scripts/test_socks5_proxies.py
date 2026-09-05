@@ -63,6 +63,7 @@ class TestResult:
     exit_ip: str = ""
     auth: str = ""
     elapsed_ms: int = 0
+    attempt: int = 1
 
 
 def read_proxy_values(path: Path) -> list[str]:
@@ -242,6 +243,7 @@ def test_one(
     value: str,
     target: tuple[str, int, str, bool],
     timeout: float,
+    attempt: int = 1,
 ) -> TestResult:
     started = time.monotonic()
     # Keep malformed entries anonymous too; the raw value may contain credentials.
@@ -271,30 +273,38 @@ def test_one(
             ipaddress.ip_address(exit_ip)
         except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, ValueError, TypeError) as exc:
             raise ProxyTestError("target_response_invalid", "target response has no valid Ip field") from exc
-        return TestResult(index, display, "success", "success", "ok", exit_ip, auth, elapsed_ms(started))
+        return TestResult(index, display, "success", "success", "ok", exit_ip, auth, elapsed_ms(started), attempt)
     except ProxyTestError as exc:
-        return TestResult(index, display, "failed", exc.category, str(exc), exit_ip, auth, elapsed_ms(started))
+        return TestResult(index, display, "failed", exc.category, str(exc), exit_ip, auth, elapsed_ms(started), attempt)
     except socket.gaierror as exc:
-        return TestResult(index, display, "failed", "proxy_dns_failed", str(exc), exit_ip, auth, elapsed_ms(started))
+        return TestResult(index, display, "failed", "proxy_dns_failed", str(exc), exit_ip, auth, elapsed_ms(started), attempt)
     except (socket.timeout, TimeoutError) as exc:
-        return TestResult(index, display, "failed", "timeout", str(exc) or "timed out", exit_ip, auth, elapsed_ms(started))
+        return TestResult(index, display, "failed", "timeout", str(exc) or "timed out", exit_ip, auth, elapsed_ms(started), attempt)
     except (ConnectionError, OSError) as exc:
-        return TestResult(index, display, "failed", "proxy_connect_failed", str(exc), exit_ip, auth, elapsed_ms(started))
+        return TestResult(index, display, "failed", "proxy_connect_failed", str(exc), exit_ip, auth, elapsed_ms(started), attempt)
     except (http.client.HTTPException, ssl.SSLError) as exc:
-        return TestResult(index, display, "failed", "target_request_failed", str(exc), exit_ip, auth, elapsed_ms(started))
+        return TestResult(index, display, "failed", "target_request_failed", str(exc), exit_ip, auth, elapsed_ms(started), attempt)
     except Exception as exc:  # noqa: BLE001 - preserve one result per proxy
-        return TestResult(index, display, "failed", "unexpected_error", str(exc), exit_ip, auth, elapsed_ms(started))
+        return TestResult(index, display, "failed", "unexpected_error", str(exc), exit_ip, auth, elapsed_ms(started), attempt)
 
 
 def elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
 
 
-def write_report(path: Path, results: Iterable[TestResult], target_url: str, timeout: float, concurrency: int) -> None:
+def write_report(
+    path: Path,
+    results: Iterable[TestResult],
+    target_url: str,
+    timeout: float,
+    concurrency: int,
+    requests_per_proxy: int,
+) -> None:
     payload = {
         "target": target_url,
         "timeout_seconds": timeout,
         "concurrency": concurrency,
+        "requests_per_proxy": requests_per_proxy,
         "results": [asdict(result) for result in results],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,12 +316,19 @@ def main() -> int:
     parser.add_argument("-p", "--proxy-file", type=Path, default=DEFAULT_PROXY_FILE)
     parser.add_argument("-u", "--url", default=DEFAULT_URL, help=f"target URL (default: {DEFAULT_URL})")
     parser.add_argument("-c", "--concurrency", type=int, default=10)
+    parser.add_argument(
+        "-n",
+        "--requests-per-proxy",
+        type=int,
+        default=1,
+        help="number of independent tests for each proxy",
+    )
     parser.add_argument("-t", "--timeout", type=float, default=15.0, help="timeout per proxy in seconds")
     parser.add_argument("--report", type=Path, help="write a JSON report without credentials")
     args = parser.parse_args()
 
-    if args.concurrency < 1 or args.timeout <= 0:
-        parser.error("concurrency must be positive and timeout must be greater than zero")
+    if args.concurrency < 1 or args.requests_per_proxy < 1 or args.timeout <= 0:
+        parser.error("concurrency and requests-per-proxy must be positive, timeout must be greater than zero")
     try:
         target = parse_target(args.url)
         values = read_proxy_values(args.proxy_file)
@@ -320,12 +337,17 @@ def main() -> int:
     if not values:
         parser.error("proxy file contains no proxy entries")
 
-    print(f"proxy-check loaded={len(values)} target={args.url} concurrency={args.concurrency}")
+    total_tests = len(values) * args.requests_per_proxy
+    print(
+        f"proxy-check loaded={len(values)} target={args.url} "
+        f"concurrency={args.concurrency} requestsPerProxy={args.requests_per_proxy} total={total_tests}"
+    )
     results: list[TestResult] = []
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = {
-            executor.submit(test_one, index, value, target, args.timeout): index
+            executor.submit(test_one, index, value, target, args.timeout, attempt): (index, attempt)
             for index, value in enumerate(values, start=1)
+            for attempt in range(1, args.requests_per_proxy + 1)
         }
         for future in as_completed(futures):
             result = future.result()
@@ -337,19 +359,23 @@ def main() -> int:
                 # contain newlines when they originate from a network error.
                 reason = f" reason={' '.join(result.message.split())}"
             print(
-                f"progress={len(results)}/{len(values)} proxy=#{result.index} "
+                f"progress={len(results)}/{total_tests} proxy=#{result.index} "
+                f"attempt={result.attempt}/{args.requests_per_proxy} "
                 f"status={result.status} category={result.category} "
                 f"elapsed_ms={result.elapsed_ms}{suffix}{reason}"
             )
 
-    results.sort(key=lambda item: item.index)
+    results.sort(key=lambda item: (item.index, item.attempt))
     counts: dict[str, int] = {}
     for result in results:
         counts[result.category] = counts.get(result.category, 0) + 1
     summary = " ".join(f"{category}={counts[category]}" for category in sorted(counts))
-    print(f"proxy-check summary total={len(results)} {summary}")
+    print(
+        f"proxy-check summary proxies={len(values)} requestsPerProxy={args.requests_per_proxy} "
+        f"total={len(results)} {summary}"
+    )
     if args.report:
-        write_report(args.report, results, args.url, args.timeout, args.concurrency)
+        write_report(args.report, results, args.url, args.timeout, args.concurrency, args.requests_per_proxy)
         print(f"proxy-check report={args.report}")
     return 0 if all(result.status == "success" for result in results) else 1
 

@@ -220,11 +220,13 @@ NAT、反向代理或隧道暴露时，才需要额外指定 `-bridge-host`：
 python .\scripts\test_socks5_proxies.py `
   --proxy-file D:\work\bridge11-proxy.csv `
   --concurrency 10 `
+  --requests-per-proxy 3 `
   --timeout 15 `
   --report D:\work\proxy-check-report.json
 ```
 
-输出会分类统计 `proxy_connect_failed`、`auth_failed`、`timeout`、`target_request_failed`、
+`--requests-per-proxy` 指定每个代理的独立测试次数，默认为 `1`；同一个代理的多次测试也会
+作为独立任务参与全局并发调度。输出会分类统计 `proxy_connect_failed`、`auth_failed`、`timeout`、`target_request_failed`、
 `target_response_invalid` 和 `success`；失败进度行同时打印具体的 `reason`。报告只保存脱敏后的
 主机端口、认证状态、失败原因和出口 IP，不会保存用户名或密码；全部成功时退出码为 `0`，
 存在失败时退出码为 `1`。
