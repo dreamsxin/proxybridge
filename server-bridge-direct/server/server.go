@@ -54,6 +54,7 @@ func Start() {
 	}
 
 	startPprof(config.Cfg.PprofAddr)
+	startMetrics(config.Cfg.MetricsAddr)
 	startStatsLogger(config.Cfg.StatsInterval)
 	// 必须在起任何桥之前设置全局配额
 	InitConnLimits()
@@ -67,28 +68,28 @@ func Start() {
 				"bridgeId", config.Cfg.BridgeId)
 		}
 	} else {
-		slog.Info("local mode: skip syncBridge and management api", "mode", config.Cfg.Mode)
+		slog.Info("local mode: skip syncBridge", "mode", config.Cfg.Mode)
 	}
 
 	InitBridgeHandler()
 
-	if config.Cfg.Mode != config.MODE_LOCAL {
-		gin.SetMode(gin.ReleaseMode)
-		// 不用 gin.Default()：它的访问日志和 panic 栈直接写 stdout，
-		// 既不进 logFile 也不参与轮转，排查时要和桥的日志分两处看
-		r := gin.New()
-		r.Use(accessLog(), recovery())
-		r.GET("/bridge/status", GetBridgeStatus)
-		r.POST("/bridge/start", StartBridge)
-		r.POST("/bridge/add", AddBridge)
-		r.POST("/bridge/del", DelBridge)
-		if config.Cfg.Addr == "" {
-			config.Cfg.Addr = ":8080"
-		}
-		slog.Info("management server listening", "addr", config.Cfg.Addr)
-		if err := r.Run(config.Cfg.Addr); err != nil {
-			slog.Error("management server exited", "addr", config.Cfg.Addr, "err", err)
-		}
+	// local 模式只是不从中心同步；本地管理 API 仍然启动，便于通过
+	// /bridge/status、/bridge/start、/bridge/add、/bridge/del 管理本地桥。
+	gin.SetMode(gin.ReleaseMode)
+	// 不用 gin.Default()：它的访问日志和 panic 栈直接写 stdout，
+	// 既不进 logFile 也不参与轮转，排查时要和桥的日志分两处看
+	r := gin.New()
+	r.Use(accessLog(), recovery())
+	r.GET("/bridge/status", GetBridgeStatus)
+	r.POST("/bridge/start", StartBridge)
+	r.POST("/bridge/add", AddBridge)
+	r.POST("/bridge/del", DelBridge)
+	if config.Cfg.Addr == "" {
+		config.Cfg.Addr = ":8080"
+	}
+	slog.Info("management server listening", "addr", config.Cfg.Addr, "mode", config.Cfg.Mode)
+	if err := r.Run(config.Cfg.Addr); err != nil {
+		slog.Error("management server exited", "addr", config.Cfg.Addr, "err", err)
 	}
 }
 
@@ -385,6 +386,9 @@ func selfPorts() map[uint16]string {
 	}
 	if p, ok := portFromAddr(config.Cfg.PprofAddr); ok {
 		ports[p] = "pprof addr"
+	}
+	if p, ok := portFromAddr(config.Cfg.MetricsAddr); ok {
+		ports[p] = "metrics addr"
 	}
 	return ports
 }

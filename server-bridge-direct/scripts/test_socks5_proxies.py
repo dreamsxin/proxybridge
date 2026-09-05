@@ -30,6 +30,10 @@ from urllib.parse import unquote, urlsplit
 
 DEFAULT_PROXY_FILE = Path(r"D:\work\bridge11-proxy.csv")
 DEFAULT_URL = "http://myip.ipipv.com/"
+SOCKS5_AUTH_STATUS = {
+    0x00: "succeeded",
+    0x01: "general SOCKS server failure",
+}
 
 
 class ProxyTestError(Exception):
@@ -76,10 +80,7 @@ def read_proxy_values(path: Path) -> list[str]:
                 if not row or not row[0].strip():
                     continue
                 value = row[0].strip()
-                if value.startswith("#"):
-                    continue
-                normalized = value.lstrip("#").strip().lower()
-                if normalized in {"proxy", "proxy_url", "proxyurl"}:
+                if is_proxy_header(value):
                     continue
                 values.append(value)
         return values
@@ -88,9 +89,14 @@ def read_proxy_values(path: Path) -> list[str]:
     with path.open("r", encoding="utf-8-sig") as source:
         for raw_line in source:
             value = raw_line.strip()
-            if value and not value.startswith("#"):
+            if value and not value.startswith("#") and not is_proxy_header(value):
                 values.append(value)
     return values
+
+
+def is_proxy_header(value: str) -> bool:
+    normalized = value.lstrip("#").strip().lower()
+    return normalized in {"proxy", "proxy_url", "proxyurl"} or "代理" in normalized
 
 
 def parse_proxy(value: str) -> ProxySpec:
@@ -159,8 +165,20 @@ def socks5_connect(sock: socket.socket, spec: ProxySpec, target_host: str, targe
             raise ProxyTestError("invalid_proxy", "SOCKS5 credentials exceed 255 bytes")
         sock.sendall(b"\x01" + bytes([len(username)]) + username + bytes([len(password)]) + password)
         auth_reply = recv_exact(sock, 2)
-        if auth_reply[0] != 1 or auth_reply[1] != 0:
-            raise ProxyTestError("auth_failed", "SOCKS5 username/password authentication failed")
+        if auth_reply[0] != 1:
+            raise ProxyTestError(
+                "proxy_protocol",
+                f"SOCKS5 auth reply version=0x{auth_reply[0]:02x}, "
+                f"raw=01 {auth_reply[0]:02x}",
+            )
+        if auth_reply[1] != 0:
+            status_name = SOCKS5_AUTH_STATUS.get(auth_reply[1], "server-specific failure")
+            raise ProxyTestError(
+                "auth_failed",
+                f"SOCKS5 username/password authentication failed: "
+                f"status=0x{auth_reply[1]:02x} ({auth_reply[1]}), {status_name}, "
+                f"raw=01 {auth_reply[1]:02x}",
+            )
         auth = "username_password"
     elif method == 0x00:
         auth = "not_required"

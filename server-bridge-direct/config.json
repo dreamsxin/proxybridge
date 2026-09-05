@@ -1,6 +1,7 @@
 {
-    "mode":"",
+    "mode":"local",
     "addr": ":5678",
+    "metricsAddr": ":9090",
     "logFile": "logs/bridge.log",
     "logConsole": true,
     "logLevel":"debug",

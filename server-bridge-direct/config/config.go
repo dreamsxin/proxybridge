@@ -51,6 +51,8 @@ type Config struct {
 
 	// PprofAddr pprof监听地址，空=关闭。只能绑到内网/回环，例如 127.0.0.1:6060
 	PprofAddr string `json:"pprofAddr"`
+	// MetricsAddr Prometheus metrics监听地址，空=关闭。建议只绑定内网或回环。
+	MetricsAddr string `json:"metricsAddr"`
 	// StatsInterval 运行指标日志间隔(秒)，0=关闭。排查泄漏时建议 60
 	StatsInterval int `json:"statsInterval"`
 	// ConnIdleTimeout 单连接空闲超时(秒)，0=不限制。

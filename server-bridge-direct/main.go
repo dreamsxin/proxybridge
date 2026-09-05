@@ -60,6 +60,7 @@ func main() {
 	}
 	// 缺失项用缺省值兜底，尤其是日志轮转：没有上界的日志迟早把磁盘写满
 	config.Cfg.ApplyDefaults()
+	printServiceEndpoints()
 	//初始化日志
 	initLog()
 
@@ -78,6 +79,22 @@ func main() {
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	sig := <-quit
 	slog.Info("bridge-direct shutting down", "signal", sig.String())
+}
+
+// printServiceEndpoints is intentionally stdout-based. Operators need to see
+// where to scrape metrics even when application logs are redirected to a file
+// and logConsole is disabled.
+func printServiceEndpoints() {
+	managementAddr := config.Cfg.Addr
+	if managementAddr == "" {
+		managementAddr = ":8080"
+	}
+	fmt.Printf("bridge-direct management listen=%s\n", managementAddr)
+	if config.Cfg.MetricsAddr == "" {
+		fmt.Println("bridge-direct metrics=disabled")
+		return
+	}
+	fmt.Printf("bridge-direct metrics listen=%s path=/metrics\n", config.Cfg.MetricsAddr)
 }
 
 // initBuildMetadata 只填充未被 linker 注入的值。正式构建的元数据优先级最高，

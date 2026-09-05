@@ -54,13 +54,13 @@ func TestLogPipeResultPromotesErrorsToErrorLevel(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(previous) })
 
-	logPipeResult("flow-up", "127.0.0.1:1000", "127.0.0.1:2000", 12, nil)
+	recordPipeResult(nil, "flow-up", "127.0.0.1:1000", "127.0.0.1:2000", 12, nil)
 	if !strings.Contains(buf.String(), "level=DEBUG") {
 		t.Fatalf("successful pipe log = %q, want DEBUG", buf.String())
 	}
 
 	buf.Reset()
-	logPipeResult("flow-down", "127.0.0.1:1000", "127.0.0.1:2000", 34, errors.New("connection reset"))
+	recordPipeResult(nil, "flow-down", "127.0.0.1:1000", "127.0.0.1:2000", 34, errors.New("connection reset"))
 	text := buf.String()
 	if !strings.Contains(text, "level=ERROR") {
 		t.Fatalf("failed pipe log = %q, want ERROR", text)
@@ -72,7 +72,7 @@ func TestLogPipeResultPromotesErrorsToErrorLevel(t *testing.T) {
 	}
 
 	buf.Reset()
-	logPipeResult("flow-up", "127.0.0.1:1000", "127.0.0.1:2000", 56, net.ErrClosed)
+	recordPipeResult(nil, "flow-up", "127.0.0.1:1000", "127.0.0.1:2000", 56, net.ErrClosed)
 	if strings.Contains(buf.String(), "level=ERROR") {
 		t.Fatalf("expected closed connection to stay below ERROR, got %q", buf.String())
 	}

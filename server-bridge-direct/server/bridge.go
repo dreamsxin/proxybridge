@@ -81,6 +81,7 @@ func globalConnInUse() int {
 }
 
 type bridgeListener struct {
+	port uint16
 	// done 在 supervisor 完全退出后关闭
 	done   chan struct{}
 	stopCh chan struct{}
@@ -96,10 +97,19 @@ type bridgeListener struct {
 	// 管理接口要据此回报「为什么没监听上」，光记日志不够。
 	bindErr atomic.Pointer[string]
 
-	accepted atomic.Int64
-	rejected atomic.Int64
-	dialOK   atomic.Int64
-	dialFail atomic.Int64
+	accepted       atomic.Int64
+	rejected       atomic.Int64
+	rejectedGlobal atomic.Int64
+	rejectedPort   atomic.Int64
+	dialOK         atomic.Int64
+	dialFail       atomic.Int64
+	bindErrors     atomic.Int64
+	acceptErrors   atomic.Int64
+	relayUpBytes   atomic.Int64
+	relayDownBytes atomic.Int64
+	dialDurationNs atomic.Int64
+	dialCount      atomic.Uint64
+	dialBuckets    [dialDurationBucketCount]atomic.Uint64
 
 	// lmu 保护 listener；bind 重试期间为 nil
 	lmu      sync.Mutex
@@ -273,6 +283,7 @@ func SetBridgeHandler(port uint16, toAddr string) error {
 	}
 
 	l := newBridgeListener(toAddr)
+	l.port = port
 	runListens[port] = l
 	runMu.Unlock()
 
@@ -326,26 +337,119 @@ type BridgeStats struct {
 	DialFail  int64
 }
 
-func CollectBridgeStats() BridgeStats {
+type bridgeMetricSnapshot struct {
+	BridgePort          uint16
+	ProxyAddr           string
+	Running             bool
+	Listening           bool
+	Conns               int
+	Accepted            int64
+	RejectedGlobal      int64
+	RejectedPort        int64
+	DialOK              int64
+	DialFail            int64
+	BindErrors          int64
+	AcceptErrors        int64
+	RelayUpBytes        int64
+	RelayDownBytes      int64
+	DialDurationNs      int64
+	DialCount           uint64
+	DialDurationBuckets [dialDurationBucketCount]uint64
+}
+
+type bridgeMetricTotals struct {
+	Accepted       atomic.Uint64
+	RejectedGlobal atomic.Uint64
+	RejectedPort   atomic.Uint64
+	DialOK         atomic.Uint64
+	DialFail       atomic.Uint64
+	BindErrors     atomic.Uint64
+	AcceptErrors   atomic.Uint64
+	RelayUpBytes   atomic.Uint64
+	RelayDownBytes atomic.Uint64
+	DialDurationNs atomic.Uint64
+	DialCount      atomic.Uint64
+	DialBuckets    [dialDurationBucketCount]atomic.Uint64
+}
+
+var metricTotals bridgeMetricTotals
+
+func collectBridgeMetricSnapshots() []bridgeMetricSnapshot {
 	runMu.RLock()
-	ls := make([]*bridgeListener, 0, len(runListens))
-	for _, l := range runListens {
+	listenersByPort := make(map[uint16]*bridgeListener, len(runListens))
+	for port, l := range runListens {
+		listenersByPort[port] = l
+	}
+	ls := make([]*bridgeListener, 0, len(listenersByPort))
+	for _, l := range listenersByPort {
 		ls = append(ls, l)
 	}
 	runMu.RUnlock()
 
-	// 不在持有 runMu 时去拿 l.mu，避免锁序交叉
-	var s BridgeStats
+	snapshots := make([]bridgeMetricSnapshot, 0, len(ls))
 	for _, l := range ls {
+		snapshot := bridgeMetricSnapshot{
+			BridgePort:     l.port,
+			ProxyAddr:      l.currentTarget(),
+			Running:        true,
+			Listening:      !l.closed.Load() && l.listening.Load(),
+			Conns:          l.connCount(),
+			Accepted:       l.accepted.Load(),
+			RejectedGlobal: l.rejectedGlobal.Load(),
+			RejectedPort:   l.rejectedPort.Load(),
+			DialOK:         l.dialOK.Load(),
+			DialFail:       l.dialFail.Load(),
+			BindErrors:     l.bindErrors.Load(),
+			AcceptErrors:   l.acceptErrors.Load(),
+			RelayUpBytes:   l.relayUpBytes.Load(),
+			RelayDownBytes: l.relayDownBytes.Load(),
+			DialDurationNs: l.dialDurationNs.Load(),
+			DialCount:      l.dialCount.Load(),
+		}
+		for i := range snapshot.DialDurationBuckets {
+			snapshot.DialDurationBuckets[i] = l.dialBuckets[i].Load()
+		}
+		snapshots = append(snapshots, snapshot)
+	}
+	// Keep configured-but-not-running bridges visible with listener_up=0. This
+	// is important for bind failures and for a bridge restored from bridge.db
+	// that has not yet been started.
+	if cf != nil {
+		for _, configured := range cf.All() {
+			if configured == nil {
+				continue
+			}
+			if _, ok := listenersByPort[configured.Port]; ok {
+				continue
+			}
+			snapshots = append(snapshots, bridgeMetricSnapshot{
+				BridgePort: configured.Port,
+				ProxyAddr:  configured.ProxyAddr,
+			})
+		}
+	}
+	return snapshots
+}
+
+func CollectBridgeStats() BridgeStats {
+	return bridgeStatsFromMetricSnapshots(collectBridgeMetricSnapshots())
+}
+
+func bridgeStatsFromMetricSnapshots(snapshots []bridgeMetricSnapshot) BridgeStats {
+	var s BridgeStats
+	for _, snapshot := range snapshots {
+		if !snapshot.Running {
+			continue
+		}
 		s.Bridges++
-		if l.listening.Load() {
+		if snapshot.Listening {
 			s.Listening++
 		}
-		s.Conns += l.connCount()
-		s.Accepted += l.accepted.Load()
-		s.Rejected += l.rejected.Load()
-		s.DialOK += l.dialOK.Load()
-		s.DialFail += l.dialFail.Load()
+		s.Conns += snapshot.Conns
+		s.Accepted += snapshot.Accepted
+		s.Rejected += snapshot.RejectedGlobal + snapshot.RejectedPort
+		s.DialOK += snapshot.DialOK
+		s.DialFail += snapshot.DialFail
 	}
 	return s
 }
@@ -407,6 +511,7 @@ func (l *bridgeListener) supervise(port uint16, fn func(conn net.Conn, toAddr st
 
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
+			recordListenerError(l, "bind")
 			l.setBindErr(err)
 			backoff = nextBackoff(backoff)
 			slog.Error("bind failed, retrying", "port", port,
@@ -451,6 +556,7 @@ func (l *bridgeListener) acceptLoop(port uint16, ln net.Listener, fn func(conn n
 				slog.Info("accept loop closed", "port", port)
 				return nil
 			}
+			recordListenerError(l, "accept")
 			// 可恢复错误（fd 耗尽等）先就地退避重试，避免为此重建 listener
 			backoff = nextBackoff(backoff)
 			slog.Error("accept failed, retrying", "port", port, "backoff", backoff, "err", err)
@@ -464,10 +570,10 @@ func (l *bridgeListener) acceptLoop(port uint16, ln net.Listener, fn func(conn n
 			continue
 		}
 		backoff = 0
-		l.accepted.Add(1)
+		recordAccepted(l)
 
 		if !acquireGlobalConn() {
-			l.rejected.Add(1)
+			recordRejected(l, "global_limit")
 			slog.Warn("conn rejected by global limit", "port", port,
 				"srcaddr", conn.RemoteAddr().String(), "maxConns", config.Cfg.MaxConns)
 			conn.Close()
@@ -475,7 +581,7 @@ func (l *bridgeListener) acceptLoop(port uint16, ln net.Listener, fn func(conn n
 		}
 		if !l.addConn(conn) {
 			releaseGlobalConn()
-			l.rejected.Add(1)
+			recordRejected(l, "port_limit")
 			slog.Warn("conn rejected by port limit", "port", port,
 				"srcaddr", conn.RemoteAddr().String(),
 				"active", l.connCount(), "limit", maxConnsPerPort())
@@ -526,14 +632,16 @@ func nextBackoff(cur time.Duration) time.Duration {
 func handlerBridge(conn net.Conn, toAddr string) {
 	srcaddr := conn.RemoteAddr().String()
 	defer conn.Close()
+	listener := listenerForConn(conn)
+	dialStarted := time.Now()
 
 	dstConn, err := net.DialTimeout("tcp", toAddr, dialTimeout)
 	if err != nil {
-		countDial(conn, false)
+		recordDial(listener, false, time.Since(dialStarted))
 		slog.Error("dial target", "srcaddr", srcaddr, "toAddr", toAddr, "err", err)
 		return
 	}
-	countDial(conn, true)
+	recordDial(listener, true, time.Since(dialStarted))
 	defer dstConn.Close()
 
 	src, dst := conn, dstConn
@@ -548,23 +656,23 @@ func handlerBridge(conn net.Conn, toAddr string) {
 	go func() {
 		defer wg.Done()
 		rn, err := pipe(dst, src)
-		logPipeResult("flow-up", srcaddr, toAddr, rn, err)
+		recordPipeResult(listener, "flow-up", srcaddr, toAddr, rn, err)
 		// 任一方向结束就把两端都关掉，让另一个方向立刻解除阻塞
 		dstConn.Close()
 		conn.Close()
 	}()
 
 	rn, err := pipe(src, dst)
-	logPipeResult("flow-down", srcaddr, toAddr, rn, err)
+	recordPipeResult(listener, "flow-down", srcaddr, toAddr, rn, err)
 	conn.Close()
 	dstConn.Close()
 	wg.Wait()
 }
 
-// logPipeResult keeps successful flow accounting at Debug while promoting any
-// non-nil copy error to Error so broken or reset connections are visible at the
-// default production log level.
-func logPipeResult(direction, srcaddr, toAddr string, amount int64, err error) {
+// recordPipeResult updates flow metrics and logs the result in one place. This
+// keeps the byte counter and the corresponding flow log from drifting apart.
+func recordPipeResult(l *bridgeListener, direction, srcaddr, toAddr string, amount int64, err error) {
+	recordRelayBytes(l, direction, amount)
 	if err != nil && !isExpectedPipeClose(err) {
 		slog.Error(direction, "srcaddr", srcaddr, "toAddr", toAddr, "amount", amount, "err", err)
 		return
@@ -583,23 +691,96 @@ func isExpectedPipeClose(err error) bool {
 	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF)
 }
 
-// countDial 把拨号结果记到对应的桥上。用 LocalAddr 的端口反查是哪个桥，
-// 避免把 *bridgeListener 一路传进 handlerBridge 改动签名。
-func countDial(conn net.Conn, ok bool) {
+func listenerForConn(conn net.Conn) *bridgeListener {
 	addr, isTCP := conn.LocalAddr().(*net.TCPAddr)
 	if !isTCP {
-		return
+		return nil
 	}
 	runMu.RLock()
 	l := runListens[uint16(addr.Port)]
 	runMu.RUnlock()
-	if l == nil {
-		return
+	return l
+}
+
+func recordAccepted(l *bridgeListener) {
+	if l != nil {
+		l.accepted.Add(1)
+	}
+	metricTotals.Accepted.Add(1)
+}
+
+func recordRejected(l *bridgeListener, reason string) {
+	if l != nil {
+		l.rejected.Add(1)
+		switch reason {
+		case "global_limit":
+			l.rejectedGlobal.Add(1)
+		case "port_limit":
+			l.rejectedPort.Add(1)
+		}
+	}
+	switch reason {
+	case "global_limit":
+		metricTotals.RejectedGlobal.Add(1)
+	case "port_limit":
+		metricTotals.RejectedPort.Add(1)
+	}
+}
+
+func recordListenerError(l *bridgeListener, stage string) {
+	if l != nil {
+		switch stage {
+		case "bind":
+			l.bindErrors.Add(1)
+		case "accept":
+			l.acceptErrors.Add(1)
+		}
+	}
+	switch stage {
+	case "bind":
+		metricTotals.BindErrors.Add(1)
+	case "accept":
+		metricTotals.AcceptErrors.Add(1)
+	}
+}
+
+func recordDial(l *bridgeListener, ok bool, duration time.Duration) {
+	bucket := dialDurationBucket(duration)
+	if l != nil {
+		if ok {
+			l.dialOK.Add(1)
+		} else {
+			l.dialFail.Add(1)
+		}
+		l.dialDurationNs.Add(duration.Nanoseconds())
+		l.dialCount.Add(1)
+		l.dialBuckets[bucket].Add(1)
 	}
 	if ok {
-		l.dialOK.Add(1)
+		metricTotals.DialOK.Add(1)
 	} else {
-		l.dialFail.Add(1)
+		metricTotals.DialFail.Add(1)
+	}
+	metricTotals.DialDurationNs.Add(uint64(duration.Nanoseconds()))
+	metricTotals.DialCount.Add(1)
+	metricTotals.DialBuckets[bucket].Add(1)
+}
+
+func recordRelayBytes(l *bridgeListener, direction string, amount int64) {
+	if amount <= 0 {
+		return
+	}
+	if l != nil {
+		if direction == "up" {
+			l.relayUpBytes.Add(amount)
+		} else {
+			l.relayDownBytes.Add(amount)
+		}
+	}
+	if direction == "up" {
+		metricTotals.RelayUpBytes.Add(uint64(amount))
+	} else {
+		metricTotals.RelayDownBytes.Add(uint64(amount))
 	}
 }
 

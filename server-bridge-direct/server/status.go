@@ -66,13 +66,35 @@ type RuntimeStats struct {
 	NumGC       uint32 `json:"numGC"`
 }
 
-// CollectRuntimeStats 采集与 startStatsLogger 相同的运行水位。
-func CollectRuntimeStats() RuntimeStats {
-	bridgeStats := CollectBridgeStats()
+type runtimeSnapshot struct {
+	BridgeSnapshots []bridgeMetricSnapshot
+	BridgeStats     BridgeStats
+	Goroutines      int
+	MemStats        runtime.MemStats
+}
+
+// collectRuntimeSnapshot is the single source for the logger, status API and
+// Prometheus runtime gauges. It walks listeners and reads runtime memory once
+// per caller instead of each consumer maintaining a separate sampling path.
+func collectRuntimeSnapshot() runtimeSnapshot {
+	bridgeSnapshots := collectBridgeMetricSnapshots()
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
+	return runtimeSnapshot{
+		BridgeSnapshots: bridgeSnapshots,
+		BridgeStats:     bridgeStatsFromMetricSnapshots(bridgeSnapshots),
+		Goroutines:      runtime.NumGoroutine(),
+		MemStats:        memStats,
+	}
+}
+
+// CollectRuntimeStats 采集与 startStatsLogger 相同的运行水位。
+func CollectRuntimeStats() RuntimeStats {
+	snapshot := collectRuntimeSnapshot()
+	bridgeStats := snapshot.BridgeStats
+	memStats := snapshot.MemStats
 	return RuntimeStats{
-		Goroutines:  runtime.NumGoroutine(),
+		Goroutines:  snapshot.Goroutines,
 		Bridges:     bridgeStats.Bridges,
 		Listening:   bridgeStats.Listening,
 		Conns:       bridgeStats.Conns,
