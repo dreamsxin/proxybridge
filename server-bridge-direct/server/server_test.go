@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -45,6 +46,39 @@ func TestAddBridgeUpdatesExistingBridgePort(t *testing.T) {
 		Port:       secondTarget.port,
 	})
 	assertProxyResponse(t, bridgePort, "second")
+}
+
+func TestLogPipeResultPromotesErrorsToErrorLevel(t *testing.T) {
+	var buf bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	logPipeResult("flow-up", "127.0.0.1:1000", "127.0.0.1:2000", 12, nil)
+	if !strings.Contains(buf.String(), "level=DEBUG") {
+		t.Fatalf("successful pipe log = %q, want DEBUG", buf.String())
+	}
+
+	buf.Reset()
+	logPipeResult("flow-down", "127.0.0.1:1000", "127.0.0.1:2000", 34, errors.New("connection reset"))
+	text := buf.String()
+	if !strings.Contains(text, "level=ERROR") {
+		t.Fatalf("failed pipe log = %q, want ERROR", text)
+	}
+	for _, field := range []string{"srcaddr", "toAddr", "amount", "err"} {
+		if !strings.Contains(text, field) {
+			t.Fatalf("failed pipe log = %q, missing field %q", text, field)
+		}
+	}
+
+	buf.Reset()
+	logPipeResult("flow-up", "127.0.0.1:1000", "127.0.0.1:2000", 56, net.ErrClosed)
+	if strings.Contains(buf.String(), "level=ERROR") {
+		t.Fatalf("expected closed connection to stay below ERROR, got %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "level=DEBUG") {
+		t.Fatalf("expected closed connection to be logged at DEBUG, got %q", buf.String())
+	}
 }
 
 func TestGetBridgeStatusReportsHealthyRuntime(t *testing.T) {

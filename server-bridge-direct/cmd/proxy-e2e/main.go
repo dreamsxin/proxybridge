@@ -46,6 +46,10 @@ var (
 	flagRequestsPerProxy = flag.Int("requests-per-proxy", 2, "requests sent through each proxy per round")
 	flagTimeout          = flag.Duration("request-timeout", 25*time.Second, "timeout for one HTTP request")
 	flagBridgeBin        = flag.String("bridge-bin", "", "bridge-direct binary; when empty, build the current module")
+	flagBridgeURL        = flag.String("bridge-url", "", "bridge management API URL; empty starts a local bridge, e.g. http://10.0.0.8:5678")
+	flagBridgeKey        = flag.String("bridge-key", "", "AES key for the bridge management API; required with -bridge-url")
+	flagBridgeHost       = flag.String("bridge-host", "", "host where bridge listener ports can be reached; remote mode defaults to the management API host")
+	flagBridgePortStart  = flag.Int("bridge-port-start", 0, "first bridge listener port; required for remote mode, then one port per proxy")
 	flagReport           = flag.String("report", "", "optional JSON report output path")
 	flagVerbose          = flag.Bool("verbose", false, "print per-proxy add/request/delete details")
 	flagDryRun           = flag.Bool("dry-run", false, "only parse and validate the proxy file")
@@ -76,6 +80,7 @@ type proxyState struct {
 	Proxy      proxySpec
 	Index      int
 	BridgePort int
+	BridgeHost string
 	Added      bool
 	ExpectedIP string
 	Mu         sync.Mutex
@@ -112,6 +117,9 @@ type roundReport struct {
 
 type testReport struct {
 	ProxyFile        string        `json:"proxyFile"`
+	BridgeURL        string        `json:"bridgeURL,omitempty"`
+	BridgeHost       string        `json:"bridgeHost,omitempty"`
+	RemoteBridge     bool          `json:"remoteBridge"`
 	Rounds           int           `json:"rounds"`
 	Concurrency      int           `json:"concurrency"`
 	RequestsPerProxy int           `json:"requestsPerProxy"`
@@ -123,7 +131,7 @@ type testReport struct {
 
 func main() {
 	flag.Parse()
-	fmt.Printf("proxy-e2e starting: proxyFile=%s rounds=%d concurrency=%d requestsPerProxy=%d\n", *flagProxyFile, *flagRounds, *flagConcurrency, *flagRequestsPerProxy)
+	fmt.Printf("proxy-e2e starting: proxyFile=%s rounds=%d concurrency=%d requestsPerProxy=%d bridgeURL=%s\n", *flagProxyFile, *flagRounds, *flagConcurrency, *flagRequestsPerProxy, *flagBridgeURL)
 	if *flagProxyFile == "" {
 		fatalf("-proxy-file is required")
 	}
@@ -150,24 +158,18 @@ func main() {
 		return
 	}
 
-	fmt.Printf("proxy-e2e preparing bridge binary\n")
-	bin, err := resolveBridgeBinary(*flagBridgeBin)
+	bridge, err := prepareBridge(len(proxies))
 	if err != nil {
-		fatalf("prepare bridge binary: %v", err)
-	}
-	if *flagBridgeBin == "" {
-		defer os.Remove(bin)
-	}
-	fmt.Printf("proxy-e2e starting bridge process\n")
-	bridge, err := startBridge(bin)
-	if err != nil {
-		fatalf("start bridge: %v", err)
+		fatalf("prepare bridge: %v", err)
 	}
 	defer bridge.Close()
-	fmt.Printf("proxy-e2e bridge management API ready at %s\n", bridge.adminAddr)
+	fmt.Printf("proxy-e2e bridge management API ready at %s listenerHost=%s remote=%t\n", bridge.adminURL, bridge.bridgeHost, bridge.remote)
 
 	report := testReport{
 		ProxyFile:        *flagProxyFile,
+		BridgeURL:        bridge.adminURL,
+		BridgeHost:       bridge.bridgeHost,
+		RemoteBridge:     bridge.remote,
 		Rounds:           *flagRounds,
 		Concurrency:      *flagConcurrency,
 		RequestsPerProxy: *flagRequestsPerProxy,
@@ -363,13 +365,169 @@ func moduleRoot() (string, error) {
 }
 
 type bridgeProc struct {
-	adminAddr string
-	dir       string
-	cmd       *exec.Cmd
-	done      chan struct{}
-	exitErr   error
-	logs      *safeBuffer
-	sync      *httptest.Server
+	adminURL   string
+	adminAddr  string
+	bridgeHost string
+	bridgeKey  string
+	portStart  int
+	remote     bool
+	bin        string
+	dir        string
+	cmd        *exec.Cmd
+	done       chan struct{}
+	exitErr    error
+	logs       *safeBuffer
+	sync       *httptest.Server
+}
+
+// prepareBridge selects local or remote mode. Local mode remains the default
+// so existing invocations keep building and starting an isolated bridge.
+// Remote mode only talks to the supplied management API and never starts or
+// stops a local bridge process.
+func prepareBridge(proxyCount int) (*bridgeProc, error) {
+	if *flagBridgeURL != "" {
+		if *flagBridgeBin != "" {
+			return nil, errors.New("-bridge-bin cannot be used with -bridge-url")
+		}
+		if *flagBridgeKey == "" {
+			return nil, errors.New("-bridge-key is required with -bridge-url")
+		}
+		if err := validateBridgeKey(*flagBridgeKey); err != nil {
+			return nil, err
+		}
+		if *flagBridgePortStart <= 0 {
+			return nil, errors.New("-bridge-port-start is required and must be positive with -bridge-url")
+		}
+		if err := validateBridgePortRange(*flagBridgePortStart, proxyCount); err != nil {
+			return nil, err
+		}
+		return newRemoteBridge(*flagBridgeURL, *flagBridgeKey, *flagBridgeHost, *flagBridgePortStart)
+	}
+
+	if err := validateOptionalBridgePortStart(*flagBridgePortStart, proxyCount); err != nil {
+		return nil, err
+	}
+	fmt.Printf("proxy-e2e preparing bridge binary\n")
+	bin, err := resolveBridgeBinary(*flagBridgeBin)
+	if err != nil {
+		return nil, fmt.Errorf("prepare bridge binary: %w", err)
+	}
+	fmt.Printf("proxy-e2e starting bridge process\n")
+	bridge, err := startBridge(bin)
+	if err != nil {
+		if *flagBridgeBin == "" {
+			_ = os.Remove(bin)
+		}
+		return nil, err
+	}
+	if *flagBridgeBin == "" {
+		// Keep the generated executable until the child process exits. Windows
+		// cannot remove a running executable, while Unix permits it.
+		bridge.bin = bin
+	}
+	bridge.portStart = *flagBridgePortStart
+	return bridge, nil
+}
+
+func validateBridgeKey(key string) error {
+	switch len([]byte(key)) {
+	case 16, 24, 32:
+		return nil
+	default:
+		return fmt.Errorf("bridge key must be 16, 24, or 32 bytes, got %d", len([]byte(key)))
+	}
+}
+
+func validateOptionalBridgePortStart(start, proxyCount int) error {
+	if start == 0 {
+		return nil
+	}
+	return validateBridgePortRange(start, proxyCount)
+}
+
+func validateBridgePortRange(start, proxyCount int) error {
+	if start < 1 || start > 65535 {
+		return fmt.Errorf("bridge-port-start must be between 1 and 65535, got %d", start)
+	}
+	if proxyCount < 1 {
+		return nil
+	}
+	last := int64(start) + int64(proxyCount) - 1
+	if last > 65535 {
+		return fmt.Errorf("bridge-port-start=%d with %d proxies exceeds port 65535", start, proxyCount)
+	}
+	return nil
+}
+
+func normalizeBridgeURL(raw string) (string, *url.URL, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil, errors.New("bridge URL is empty")
+	}
+	if !strings.Contains(value, "://") {
+		value = "http://" + value
+	}
+	u, err := url.Parse(value)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse bridge URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", nil, fmt.Errorf("unsupported bridge URL scheme %q, want http or https", u.Scheme)
+	}
+	if u.Host == "" || u.Hostname() == "" {
+		return "", nil, errors.New("bridge URL must include a host")
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", nil, errors.New("bridge URL must not contain user info, query, or fragment")
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	return strings.TrimRight(u.String(), "/"), u, nil
+}
+
+func newRemoteBridge(rawURL, key, listenerHost string, portStart int) (*bridgeProc, error) {
+	adminURL, parsed, err := normalizeBridgeURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	listenerHost = strings.TrimSpace(listenerHost)
+	if listenerHost == "" {
+		listenerHost = parsed.Hostname()
+	}
+	b := &bridgeProc{
+		adminURL:   adminURL,
+		bridgeHost: listenerHost,
+		bridgeKey:  key,
+		portStart:  portStart,
+		remote:     true,
+	}
+	if err := waitManagementAPI(parsed, 10*time.Second); err != nil {
+		return nil, err
+	}
+	return b, nil
+}
+
+func waitManagementAPI(u *url.URL, within time.Duration) error {
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	addr := net.JoinHostPort(u.Hostname(), port)
+	deadline := time.Now().Add(within)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("bridge management API %s is unreachable: %w", u.String(), lastErr)
 }
 
 func startBridge(bin string) (*bridgeProc, error) {
@@ -416,9 +574,12 @@ func startBridge(bin string) (*bridgeProc, error) {
 	}
 	done := make(chan struct{})
 	b := &bridgeProc{
-		adminAddr: net.JoinHostPort("127.0.0.1", strconv.Itoa(adminPort)),
-		dir:       dir,
-		cmd:       cmd, done: done, logs: logs, sync: syncServer,
+		adminAddr:  net.JoinHostPort("127.0.0.1", strconv.Itoa(adminPort)),
+		adminURL:   "http://" + net.JoinHostPort("127.0.0.1", strconv.Itoa(adminPort)),
+		bridgeHost: "127.0.0.1",
+		bridgeKey:  testKey,
+		dir:        dir,
+		cmd:        cmd, done: done, logs: logs, sync: syncServer,
 	}
 	go func() {
 		b.exitErr = cmd.Wait()
@@ -460,6 +621,9 @@ func (b *bridgeProc) Close() {
 	if b.dir != "" {
 		_ = os.RemoveAll(b.dir)
 	}
+	if b.bin != "" {
+		_ = os.Remove(b.bin)
+	}
 }
 
 func (b *bridgeProc) call(path string, payload dto.UseBridge) (dto.Res, error) {
@@ -468,7 +632,7 @@ func (b *bridgeProc) call(path string, payload dto.UseBridge) (dto.Res, error) {
 	if err != nil {
 		return res, err
 	}
-	enc, err := utils.AesEncryptCBC(plain, []byte(testKey))
+	enc, err := utils.AesEncryptCBC(plain, []byte(b.bridgeKey))
 	if err != nil {
 		return res, err
 	}
@@ -476,7 +640,7 @@ func (b *bridgeProc) call(path string, payload dto.UseBridge) (dto.Res, error) {
 	if err != nil {
 		return res, err
 	}
-	req, err := http.NewRequest(http.MethodPost, "http://"+b.adminAddr+path, bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, b.adminURL+path, bytes.NewReader(body))
 	if err != nil {
 		return res, err
 	}
@@ -494,7 +658,24 @@ func (b *bridgeProc) call(path string, payload dto.UseBridge) (dto.Res, error) {
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return res, fmt.Errorf("decode response %q: %w", truncate(raw, 300), err)
 	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return res, fmt.Errorf("management API HTTP status %d: %s", resp.StatusCode, truncate(raw, 300))
+	}
 	return res, nil
+}
+
+func (b *bridgeProc) allocatePort(index int) (int, error) {
+	if b.portStart > 0 {
+		port := b.portStart + index - 1
+		if port < 1 || port > 65535 {
+			return 0, fmt.Errorf("bridge port %d is outside 1..65535", port)
+		}
+		return port, nil
+	}
+	if b.remote {
+		return 0, errors.New("remote bridge requires -bridge-port-start")
+	}
+	return freePort()
 }
 
 func runRound(b *bridgeProc, proxies []proxySpec, round int) roundReport {
@@ -504,9 +685,9 @@ func runRound(b *bridgeProc, proxies []proxySpec, round int) roundReport {
 	}
 	states := make([]*proxyState, len(proxies))
 	for i, p := range proxies {
-		state := &proxyState{Proxy: p, Index: i + 1}
+		state := &proxyState{Proxy: p, Index: i + 1, BridgeHost: b.bridgeHost}
 		states[i] = state
-		port, err := freePort()
+		port, err := b.allocatePort(i + 1)
 		if err != nil {
 			r.AddFailed++
 			addClass(&r, "add_port_alloc")
@@ -615,11 +796,23 @@ func runRound(b *bridgeProc, proxies []proxySpec, round int) roundReport {
 		}
 	}
 
-	fmt.Printf("round=%d phase=del start total=%d\n", round, len(proxies))
+	delTotal := 0
+	for _, state := range states {
+		if state.BridgePort != 0 && (!b.remote || state.Added) {
+			delTotal++
+		}
+	}
+	fmt.Printf("round=%d phase=del start total=%d\n", round, delTotal)
+	delProgress := 0
 	for i, state := range states {
-		if state.BridgePort == 0 {
+		// A remote port may already belong to another test. Never issue DEL for
+		// an add that did not succeed in remote mode, or a collision could remove
+		// someone else's bridge. Local mode allocates a free port and retains the
+		// old cleanup behavior for partially applied adds.
+		if state.BridgePort == 0 || (b.remote && !state.Added) {
 			continue
 		}
+		delProgress++
 		res, err := b.call("/bridge/del", dto.UseBridge{BridgePort: uint16(state.BridgePort)})
 		if err != nil || res.Code != 200 {
 			r.DeleteFailed++
@@ -629,17 +822,17 @@ func runRound(b *bridgeProc, proxies []proxySpec, round int) roundReport {
 			} else {
 				addSample(&r, fmt.Sprintf("proxy %d %s: del code=%d msg=%s", i+1, state.Proxy.label(), res.Code, res.Msg))
 			}
-			fmt.Printf("round=%d phase=del progress=%d/%d status=failed class=del_api proxy=#%d %s\n", round, i+1, len(proxies), i+1, state.Proxy.label())
+			fmt.Printf("round=%d phase=del progress=%d/%d status=failed class=del_api proxy=#%d %s\n", round, delProgress, delTotal, i+1, state.Proxy.label())
 			continue
 		}
 		r.DeleteOK++
-		if !waitPortClosed(state.BridgePort, 3*time.Second) {
+		if !waitPortClosed(state.BridgeHost, state.BridgePort, 3*time.Second) {
 			r.DeleteVerifyFail++
 			addClass(&r, "del_verify")
 			addSample(&r, fmt.Sprintf("proxy %d %s: bridge port %d still accepts connections", i+1, state.Proxy.label(), state.BridgePort))
-			fmt.Printf("round=%d phase=del progress=%d/%d status=failed class=del_verify proxy=#%d %s\n", round, i+1, len(proxies), i+1, state.Proxy.label())
+			fmt.Printf("round=%d phase=del progress=%d/%d status=failed class=del_verify proxy=#%d %s\n", round, delProgress, delTotal, i+1, state.Proxy.label())
 		} else {
-			fmt.Printf("round=%d phase=del progress=%d/%d status=ok bridgePort=%d proxy=#%d %s\n", round, i+1, len(proxies), state.BridgePort, i+1, state.Proxy.label())
+			fmt.Printf("round=%d phase=del progress=%d/%d status=ok bridgePort=%d proxy=#%d %s\n", round, delProgress, delTotal, state.BridgePort, i+1, state.Proxy.label())
 		}
 		if *flagVerbose {
 			fmt.Printf("round=%d proxy=%d/%d del=ok bridgePort=%d\n", round, i+1, len(proxies), state.BridgePort)
@@ -678,7 +871,7 @@ func fetchViaProxy(state *proxyState) (string, string, error) {
 		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 10 * time.Second}
-			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(state.BridgePort)))
+			conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(state.BridgeHost, strconv.Itoa(state.BridgePort)))
 			if err != nil {
 				return nil, &stageError{Class: "bridge_connect", Err: err}
 			}
@@ -859,9 +1052,9 @@ func discardSocksBoundAddr(conn net.Conn, atyp byte) error {
 	}
 }
 
-func waitPortClosed(port int, within time.Duration) bool {
+func waitPortClosed(host string, port int, within time.Duration) bool {
 	deadline := time.Now().Add(within)
-	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
 		if err != nil {

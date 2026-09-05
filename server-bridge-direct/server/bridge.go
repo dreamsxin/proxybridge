@@ -548,17 +548,39 @@ func handlerBridge(conn net.Conn, toAddr string) {
 	go func() {
 		defer wg.Done()
 		rn, err := pipe(dst, src)
-		slog.Debug("flow-up", "srcaddr", srcaddr, "toAddr", toAddr, "amount", rn, "err", err)
+		logPipeResult("flow-up", srcaddr, toAddr, rn, err)
 		// 任一方向结束就把两端都关掉，让另一个方向立刻解除阻塞
 		dstConn.Close()
 		conn.Close()
 	}()
 
 	rn, err := pipe(src, dst)
-	slog.Debug("flow-down", "srcaddr", srcaddr, "toAddr", toAddr, "amount", rn, "err", err)
+	logPipeResult("flow-down", srcaddr, toAddr, rn, err)
 	conn.Close()
 	dstConn.Close()
 	wg.Wait()
+}
+
+// logPipeResult keeps successful flow accounting at Debug while promoting any
+// non-nil copy error to Error so broken or reset connections are visible at the
+// default production log level.
+func logPipeResult(direction, srcaddr, toAddr string, amount int64, err error) {
+	if err != nil && !isExpectedPipeClose(err) {
+		slog.Error(direction, "srcaddr", srcaddr, "toAddr", toAddr, "amount", amount, "err", err)
+		return
+	}
+	if err != nil {
+		// 任一方向结束后 handler 会主动关闭另一端；该方向经常收到
+		// net.ErrClosed（文本通常是 "use of closed network connection"），
+		// 这是正常收尾，不应在生产日志中制造 ERROR 噪声。
+		slog.Debug(direction, "srcaddr", srcaddr, "toAddr", toAddr, "amount", amount, "err", err)
+		return
+	}
+	slog.Debug(direction, "srcaddr", srcaddr, "toAddr", toAddr, "amount", amount)
+}
+
+func isExpectedPipeClose(err error) bool {
+	return errors.Is(err, net.ErrClosed) || errors.Is(err, io.EOF)
 }
 
 // countDial 把拨号结果记到对应的桥上。用 LocalAddr 的端口反查是哪个桥，
