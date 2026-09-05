@@ -331,10 +331,15 @@ def main() -> int:
             result = future.result()
             results.append(result)
             suffix = f" ip={result.exit_ip}" if result.exit_ip else ""
+            reason = ""
+            if result.status != "success" and result.message:
+                # Keep one failed result on one console line; messages may
+                # contain newlines when they originate from a network error.
+                reason = f" reason={' '.join(result.message.split())}"
             print(
                 f"progress={len(results)}/{len(values)} proxy=#{result.index} "
                 f"status={result.status} category={result.category} "
-                f"elapsed_ms={result.elapsed_ms}{suffix}"
+                f"elapsed_ms={result.elapsed_ms}{suffix}{reason}"
             )
 
     results.sort(key=lambda item: item.index)

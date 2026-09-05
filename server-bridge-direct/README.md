@@ -225,8 +225,9 @@ python .\scripts\test_socks5_proxies.py `
 ```
 
 输出会分类统计 `proxy_connect_failed`、`auth_failed`、`timeout`、`target_request_failed`、
-`target_response_invalid` 和 `success`。报告只保存脱敏后的主机端口、认证状态和出口 IP，
-不会保存用户名或密码；全部成功时退出码为 `0`，存在失败时退出码为 `1`。
+`target_response_invalid` 和 `success`；失败进度行同时打印具体的 `reason`。报告只保存脱敏后的
+主机端口、认证状态、失败原因和出口 IP，不会保存用户名或密码；全部成功时退出码为 `0`，
+存在失败时退出码为 `1`。
 
 查看任一工具的完整参数说明：
 
