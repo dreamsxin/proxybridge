@@ -126,10 +126,12 @@ python .\scripts\convert_bridge11.py `
 
 ## 批量代理 bridge e2e 测试
 
-`cmd/proxy-e2e` 每轮执行以下流程：读取代理列表，为每个代理调用 `/bridge/add`，并发请求
+`cmd/proxy-e2e` 每轮执行以下流程：读取代理列表，并发调用 `/bridge/add`，并发请求
 `http://myip.ipipv.com/`，检查返回 JSON 的 `Ip` 字段和同一代理多次请求的出口 IP 一致性，
-最后调用 `/bridge/del` 并检查 bridge 端口已关闭。`-requests-per-proxy` 会为每个代理生成多个
-请求任务，由全局 worker pool 按 `-concurrency` 调度；同一个代理的请求不保证同时启动。
+最后并发调用 `/bridge/del` 并检查 bridge 端口已关闭。`-concurrency`（简写 `-c`）同时限制
+add、request、del 三个阶段的 worker 数；每个任务携带自己的代理索引和 bridge 端口，结果按任务
+回写，不会因为并发丢失代理对应关系。`-requests-per-proxy` 会为每个代理生成多个请求任务，
+同一个代理的请求不保证同时启动。
 
 ### 本地 bridge（默认）
 
@@ -186,7 +188,7 @@ NAT、反向代理或隧道暴露时，才需要额外指定 `-bridge-host`：
 |---|---:|---|
 | `-proxy-file` | 必填 | TXT 或 CSV 代理列表 |
 | `-rounds` | `1` | 测试轮数 |
-| `-concurrency` | `10` | 最大并发请求数 |
+| `-concurrency`, `-c` | `10` | add/request/del 三个阶段的最大并发数 |
 | `-requests-per-proxy` | `2` | 每个代理每轮请求任务数 |
 | `-request-timeout` | `25s` | 单次 HTTP 请求超时 |
 | `-bridge-bin` | 自动构建 | 本地模式使用的 bridge 二进制 |

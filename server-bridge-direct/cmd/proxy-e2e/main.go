@@ -42,7 +42,8 @@ const (
 var (
 	flagRounds           = flag.Int("rounds", 1, "number of add/request/delete rounds")
 	flagProxyFile        = flag.String("proxy-file", "", "proxy list file: one URL per line or CSV first column")
-	flagConcurrency      = flag.Int("concurrency", 10, "maximum concurrent requests")
+	flagConcurrency      = flag.Int("concurrency", 10, "maximum concurrent add/request/delete calls")
+	flagConcurrencyShort = flag.Int("c", 0, "short form of -concurrency")
 	flagRequestsPerProxy = flag.Int("requests-per-proxy", 2, "requests sent through each proxy per round")
 	flagTimeout          = flag.Duration("request-timeout", 25*time.Second, "timeout for one HTTP request")
 	flagBridgeBin        = flag.String("bridge-bin", "", "bridge-direct binary; when empty, build the current module")
@@ -100,6 +101,18 @@ type requestResult struct {
 	Elapsed time.Duration
 }
 
+type addResult struct {
+	State *proxyState
+	Class string
+	Err   error
+}
+
+type deleteResult struct {
+	State       *proxyState
+	APIError    error
+	VerifyError error
+}
+
 type roundReport struct {
 	Round            int                 `json:"round"`
 	ProxyCount       int                 `json:"proxyCount"`
@@ -131,11 +144,12 @@ type testReport struct {
 
 func main() {
 	flag.Parse()
-	fmt.Printf("proxy-e2e starting: proxyFile=%s rounds=%d concurrency=%d requestsPerProxy=%d bridgeURL=%s\n", *flagProxyFile, *flagRounds, *flagConcurrency, *flagRequestsPerProxy, *flagBridgeURL)
+	concurrency := configuredConcurrency()
+	fmt.Printf("proxy-e2e starting: proxyFile=%s rounds=%d concurrency=%d requestsPerProxy=%d bridgeURL=%s\n", *flagProxyFile, *flagRounds, concurrency, *flagRequestsPerProxy, *flagBridgeURL)
 	if *flagProxyFile == "" {
 		fatalf("-proxy-file is required")
 	}
-	if *flagRounds <= 0 || *flagConcurrency <= 0 || *flagRequestsPerProxy <= 0 {
+	if *flagRounds <= 0 || concurrency <= 0 || *flagRequestsPerProxy <= 0 {
 		fatalf("rounds, concurrency and requests-per-proxy must be positive")
 	}
 	proxies, err := loadProxies(*flagProxyFile)
@@ -171,14 +185,14 @@ func main() {
 		BridgeHost:       bridge.bridgeHost,
 		RemoteBridge:     bridge.remote,
 		Rounds:           *flagRounds,
-		Concurrency:      *flagConcurrency,
+		Concurrency:      concurrency,
 		RequestsPerProxy: *flagRequestsPerProxy,
 		StartedAt:        time.Now(),
 		ProxyCount:       len(proxies),
 	}
 	failed := false
 	for round := 1; round <= *flagRounds; round++ {
-		fmt.Printf("round=%d/%d phase=add start total=%d\n", round, *flagRounds, len(proxies))
+		fmt.Printf("round=%d/%d phase=add start total=%d concurrency=%d\n", round, *flagRounds, len(proxies), concurrency)
 		r := runRound(bridge, proxies, round)
 		report.RoundReports = append(report.RoundReports, r)
 		if r.AddFailed > 0 || r.RequestOK != r.RequestTotal || r.DeleteFailed > 0 || r.DeleteVerifyFail > 0 {
@@ -188,6 +202,7 @@ func main() {
 		fmt.Printf("round=%d/%d complete\n", round, *flagRounds)
 	}
 	report.FinishedAt = time.Now()
+	printTestSummary(report, failed)
 
 	if *flagReport != "" {
 		data, err := json.MarshalIndent(report, "", "  ")
@@ -202,6 +217,13 @@ func main() {
 	if failed {
 		os.Exit(1)
 	}
+}
+
+func configuredConcurrency() int {
+	if *flagConcurrencyShort > 0 {
+		return *flagConcurrencyShort
+	}
+	return *flagConcurrency
 }
 
 func fatalf(format string, args ...any) {
@@ -696,38 +718,89 @@ func runRound(b *bridgeProc, proxies []proxySpec, round int) roundReport {
 			continue
 		}
 		state.BridgePort = port
-		bridgeIP, err := resolveProxyIP(p.Host)
-		if err != nil {
-			r.AddFailed++
-			addClass(&r, "add_proxy_resolve")
-			addSample(&r, fmt.Sprintf("proxy %d %s: resolve host for bridge/add: %v", i+1, p.label(), err))
-			fmt.Printf("round=%d phase=add progress=%d/%d status=failed class=add_proxy_resolve proxy=#%d %s\n", round, i+1, len(proxies), i+1, p.label())
-			continue
+	}
+
+	// Add calls are independent because every proxy receives its own bridge
+	// port. Use the same worker limit as the request phase and handle results in
+	// this goroutine so report counters and console progress stay race-free.
+	addPending := 0
+	for _, state := range states {
+		if state.BridgePort != 0 {
+			addPending++
 		}
-		res, err := b.call("/bridge/add", dto.UseBridge{BridgePort: uint16(port), Ip: bridgeIP, Port: uint16(p.Port)})
-		if err != nil || res.Code != 200 {
-			r.AddFailed++
-			addClass(&r, "add_api")
-			if err != nil {
-				addSample(&r, fmt.Sprintf("proxy %d %s: add: %v", i+1, p.label(), err))
-			} else {
-				addSample(&r, fmt.Sprintf("proxy %d %s: add code=%d msg=%s", i+1, p.label(), res.Code, res.Msg))
+	}
+	addWorkers := configuredConcurrency()
+	if addWorkers > addPending {
+		addWorkers = addPending
+	}
+	if addWorkers > 0 {
+		addJobs := make(chan *proxyState)
+		addResults := make(chan addResult)
+		var addWait sync.WaitGroup
+		for i := 0; i < addWorkers; i++ {
+			addWait.Add(1)
+			go func() {
+				defer addWait.Done()
+				for state := range addJobs {
+					bridgeIP, err := resolveProxyIP(state.Proxy.Host)
+					if err != nil {
+						addResults <- addResult{State: state, Class: "add_proxy_resolve", Err: fmt.Errorf("resolve host for bridge/add: %w", err)}
+						continue
+					}
+					res, err := b.call("/bridge/add", dto.UseBridge{
+						BridgePort: uint16(state.BridgePort),
+						Ip:         bridgeIP,
+						Port:       uint16(state.Proxy.Port),
+					})
+					if err != nil {
+						addResults <- addResult{State: state, Class: "add_api", Err: err}
+						continue
+					}
+					if res.Code != 200 {
+						addResults <- addResult{
+							State: state, Class: "add_api",
+							Err: fmt.Errorf("add code=%d msg=%s", res.Code, res.Msg),
+						}
+						continue
+					}
+					addResults <- addResult{State: state, Class: "success"}
+				}
+			}()
+		}
+		go func() {
+			for _, state := range states {
+				if state.BridgePort != 0 {
+					addJobs <- state
+				}
 			}
-			fmt.Printf("round=%d phase=add progress=%d/%d status=failed class=add_api proxy=#%d %s\n", round, i+1, len(proxies), i+1, p.label())
-			continue
-		}
-		r.AddOK++
-		state.Added = true
-		fmt.Printf("round=%d phase=add progress=%d/%d status=ok bridgePort=%d proxy=#%d %s\n", round, i+1, len(proxies), port, i+1, p.label())
-		if *flagVerbose {
-			fmt.Printf("round=%d proxy=%d/%d add=ok bridgePort=%d proxy=%s\n", round, i+1, len(proxies), port, p.label())
+			close(addJobs)
+			addWait.Wait()
+			close(addResults)
+		}()
+		addProgress := 0
+		for result := range addResults {
+			addProgress++
+			state := result.State
+			if result.Err != nil {
+				r.AddFailed++
+				addClass(&r, result.Class)
+				addSample(&r, fmt.Sprintf("proxy %d %s: %s: %v", state.Index, state.Proxy.label(), result.Class, result.Err))
+				fmt.Printf("round=%d phase=add progress=%d/%d status=failed class=%s proxy=#%d %s\n", round, addProgress, addPending, result.Class, state.Index, state.Proxy.label())
+				continue
+			}
+			r.AddOK++
+			state.Added = true
+			fmt.Printf("round=%d phase=add progress=%d/%d status=ok bridgePort=%d proxy=#%d %s\n", round, addProgress, addPending, state.BridgePort, state.Index, state.Proxy.label())
+			if *flagVerbose {
+				fmt.Printf("round=%d proxy=%d/%d add=ok bridgePort=%d proxy=%s\n", round, state.Index, len(proxies), state.BridgePort, state.Proxy.label())
+			}
 		}
 	}
 
 	jobs := make(chan requestJob)
 	results := make(chan requestResult)
 	var workers sync.WaitGroup
-	workerCount := *flagConcurrency
+	workerCount := configuredConcurrency()
 	totalJobs := r.AddOK * *flagRequestsPerProxy
 	if workerCount > totalJobs {
 		workerCount = totalJobs
@@ -803,39 +876,71 @@ func runRound(b *bridgeProc, proxies []proxySpec, round int) roundReport {
 		}
 	}
 	fmt.Printf("round=%d phase=del start total=%d\n", round, delTotal)
-	delProgress := 0
-	for i, state := range states {
-		// A remote port may already belong to another test. Never issue DEL for
-		// an add that did not succeed in remote mode, or a collision could remove
-		// someone else's bridge. Local mode allocates a free port and retains the
-		// old cleanup behavior for partially applied adds.
-		if state.BridgePort == 0 || (b.remote && !state.Added) {
-			continue
+	if delTotal > 0 {
+		delJobs := make(chan *proxyState)
+		delResults := make(chan deleteResult)
+		delWorkers := configuredConcurrency()
+		if delWorkers > delTotal {
+			delWorkers = delTotal
 		}
-		delProgress++
-		res, err := b.call("/bridge/del", dto.UseBridge{BridgePort: uint16(state.BridgePort)})
-		if err != nil || res.Code != 200 {
-			r.DeleteFailed++
-			addClass(&r, "del_api")
-			if err != nil {
-				addSample(&r, fmt.Sprintf("proxy %d %s: del: %v", i+1, state.Proxy.label(), err))
-			} else {
-				addSample(&r, fmt.Sprintf("proxy %d %s: del code=%d msg=%s", i+1, state.Proxy.label(), res.Code, res.Msg))
+		var delWait sync.WaitGroup
+		for i := 0; i < delWorkers; i++ {
+			delWait.Add(1)
+			go func() {
+				defer delWait.Done()
+				for state := range delJobs {
+					res, err := b.call("/bridge/del", dto.UseBridge{BridgePort: uint16(state.BridgePort)})
+					if err != nil {
+						delResults <- deleteResult{State: state, APIError: err}
+						continue
+					}
+					if res.Code != 200 {
+						delResults <- deleteResult{State: state, APIError: fmt.Errorf("del code=%d msg=%s", res.Code, res.Msg)}
+						continue
+					}
+					result := deleteResult{State: state}
+					if !waitPortClosed(state.BridgeHost, state.BridgePort, 3*time.Second) {
+						result.VerifyError = fmt.Errorf("bridge port %d still accepts connections", state.BridgePort)
+					}
+					delResults <- result
+				}
+			}()
+		}
+		go func() {
+			for _, state := range states {
+				// A remote port may already belong to another test. Never issue DEL
+				// for an add that did not succeed in remote mode.
+				if state.BridgePort != 0 && (!b.remote || state.Added) {
+					delJobs <- state
+				}
 			}
-			fmt.Printf("round=%d phase=del progress=%d/%d status=failed class=del_api proxy=#%d %s\n", round, delProgress, delTotal, i+1, state.Proxy.label())
-			continue
-		}
-		r.DeleteOK++
-		if !waitPortClosed(state.BridgeHost, state.BridgePort, 3*time.Second) {
-			r.DeleteVerifyFail++
-			addClass(&r, "del_verify")
-			addSample(&r, fmt.Sprintf("proxy %d %s: bridge port %d still accepts connections", i+1, state.Proxy.label(), state.BridgePort))
-			fmt.Printf("round=%d phase=del progress=%d/%d status=failed class=del_verify proxy=#%d %s\n", round, delProgress, delTotal, i+1, state.Proxy.label())
-		} else {
-			fmt.Printf("round=%d phase=del progress=%d/%d status=ok bridgePort=%d proxy=#%d %s\n", round, delProgress, delTotal, state.BridgePort, i+1, state.Proxy.label())
-		}
-		if *flagVerbose {
-			fmt.Printf("round=%d proxy=%d/%d del=ok bridgePort=%d\n", round, i+1, len(proxies), state.BridgePort)
+			close(delJobs)
+			delWait.Wait()
+			close(delResults)
+		}()
+		delProgress := 0
+		for result := range delResults {
+			delProgress++
+			state := result.State
+			if result.APIError != nil {
+				r.DeleteFailed++
+				addClass(&r, "del_api")
+				addSample(&r, fmt.Sprintf("proxy %d %s: del: %v", state.Index, state.Proxy.label(), result.APIError))
+				fmt.Printf("round=%d phase=del progress=%d/%d status=failed class=del_api proxy=#%d %s\n", round, delProgress, delTotal, state.Index, state.Proxy.label())
+				continue
+			}
+			r.DeleteOK++
+			if result.VerifyError != nil {
+				r.DeleteVerifyFail++
+				addClass(&r, "del_verify")
+				addSample(&r, fmt.Sprintf("proxy %d %s: %v", state.Index, state.Proxy.label(), result.VerifyError))
+				fmt.Printf("round=%d phase=del progress=%d/%d status=failed class=del_verify proxy=#%d %s\n", round, delProgress, delTotal, state.Index, state.Proxy.label())
+			} else {
+				fmt.Printf("round=%d phase=del progress=%d/%d status=ok bridgePort=%d proxy=#%d %s\n", round, delProgress, delTotal, state.BridgePort, state.Index, state.Proxy.label())
+			}
+			if *flagVerbose {
+				fmt.Printf("round=%d phase=del progress=%d/%d proxy=#%d del=ok bridgePort=%d\n", round, delProgress, delTotal, state.Index, state.BridgePort)
+			}
 		}
 	}
 	return r
@@ -863,6 +968,32 @@ func printRound(r roundReport) {
 	for label, ips := range r.ProxyIPs {
 		fmt.Printf("  proxy=%s expectedIPs=%v\n", label, ips)
 	}
+}
+
+func printTestSummary(report testReport, failed bool) {
+	var addOK, addFailed, requestTotal, requestOK, deleteOK, deleteFailed, deleteVerifyFailed int
+	classes := make(map[string]int)
+	for _, round := range report.RoundReports {
+		addOK += round.AddOK
+		addFailed += round.AddFailed
+		requestTotal += round.RequestTotal
+		requestOK += round.RequestOK
+		deleteOK += round.DeleteOK
+		deleteFailed += round.DeleteFailed
+		deleteVerifyFailed += round.DeleteVerifyFail
+		for class, count := range round.Classes {
+			classes[class] += count
+		}
+	}
+	rate := 0.0
+	if requestTotal > 0 {
+		rate = float64(requestOK) * 100 / float64(requestTotal)
+	}
+	status := "passed"
+	if failed {
+		status = "failed"
+	}
+	fmt.Printf("proxy-e2e summary status=%s rounds=%d proxiesPerRound=%d addOK=%d addFailed=%d requests=%d ok=%d successRate=%.2f%% delOK=%d delFailed=%d delVerifyFailed=%d classes=%v\n", status, len(report.RoundReports), report.ProxyCount, addOK, addFailed, requestTotal, requestOK, rate, deleteOK, deleteFailed, deleteVerifyFailed, classes)
 }
 
 func fetchViaProxy(state *proxyState) (string, string, error) {

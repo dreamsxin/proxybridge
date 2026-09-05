@@ -12,7 +12,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/baowk/bridge-direct/server/dto"
 	"github.com/baowk/bridge-direct/utils"
@@ -142,6 +145,98 @@ func TestRemoteBridgePortPlan(t *testing.T) {
 	}
 	if err := validateBridgePortRange(65535, 2); err == nil {
 		t.Fatal("expected bridge port range overflow")
+	}
+}
+
+func TestRunRoundConcurrentManagementCallsKeepProxyMapping(t *testing.T) {
+	var active, maxActive atomic.Int32
+	var mu sync.Mutex
+	addTargets := make(map[int]string)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := active.Add(1)
+		for {
+			seen := maxActive.Load()
+			if current <= seen || maxActive.CompareAndSwap(seen, current) {
+				break
+			}
+		}
+		defer active.Add(-1)
+		time.Sleep(20 * time.Millisecond)
+
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read body: %v", err)
+			return
+		}
+		var req dto.Req
+		if err := json.Unmarshal(raw, &req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		ciphertext, err := base64.StdEncoding.DecodeString(req.Data)
+		if err != nil {
+			t.Errorf("decode data: %v", err)
+			return
+		}
+		plaintext, err := utils.AesDecryptCBC(ciphertext, []byte(testKey))
+		if err != nil {
+			t.Errorf("decrypt data: %v", err)
+			return
+		}
+		var bridge dto.UseBridge
+		if err := json.Unmarshal(plaintext, &bridge); err != nil {
+			t.Errorf("decode bridge: %v", err)
+			return
+		}
+		mu.Lock()
+		if r.URL.Path == "/bridge/add" {
+			addTargets[int(bridge.BridgePort)] = bridge.Ip
+		} else if r.URL.Path == "/bridge/del" {
+			if _, ok := addTargets[int(bridge.BridgePort)]; !ok {
+				t.Errorf("del for unknown bridge port %d", bridge.BridgePort)
+			}
+		}
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"code":200,"msg":"ok"}`)
+	}))
+	defer server.Close()
+
+	oldConcurrency, oldShort := *flagConcurrency, *flagConcurrencyShort
+	oldRequests, oldVerbose := *flagRequestsPerProxy, *flagVerbose
+	defer func() {
+		*flagConcurrency, *flagConcurrencyShort = oldConcurrency, oldShort
+		*flagRequestsPerProxy, *flagVerbose = oldRequests, oldVerbose
+	}()
+	*flagConcurrency = 3
+	*flagConcurrencyShort = 0
+	*flagRequestsPerProxy = 0
+	*flagVerbose = false
+
+	proxies := make([]proxySpec, 4)
+	for i := range proxies {
+		proxies[i] = proxySpec{Scheme: "socks5", Host: fmt.Sprintf("198.51.100.%d", i+1), Port: 1080 + i}
+	}
+	bridge := &bridgeProc{
+		adminURL:   server.URL,
+		bridgeHost: "127.0.0.1",
+		bridgeKey:  testKey,
+		portStart:  30000,
+		remote:     true,
+	}
+	r := runRound(bridge, proxies, 1)
+	if r.AddOK != len(proxies) || r.AddFailed != 0 || r.DeleteOK != len(proxies) || r.DeleteFailed != 0 {
+		t.Fatalf("round result = %+v", r)
+	}
+	if maxActive.Load() < 2 {
+		t.Fatalf("management API calls were not concurrent, max active=%d", maxActive.Load())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i := range proxies {
+		if got := addTargets[30000+i]; got != proxies[i].Host {
+			t.Fatalf("bridge port %d target=%q, want %q", 30000+i, got, proxies[i].Host)
+		}
 	}
 }
 

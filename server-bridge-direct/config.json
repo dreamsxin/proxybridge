@@ -1,12 +1,21 @@
 {
-    "mode":"local",
+    "mode":"",
     "addr": ":5678",
     "logFile": "logs/bridge.log",
     "logConsole": true,
-    "logLevel":"info",
+    "logLevel":"debug",
     "logFormat":"text",
+    "logSource":true,
+    "logMaxSizeMB": 100,
+    "logMaxAgeDays": 7,
+    "logMaxBackups": 10,
+    "logCompress": true,
     "syncDomain":"http://192.168.0.250:7888",
     "key":"abcd1234poiu5678bvbvnbnb",
     "dataFilename":"bridge.db",
-    "bridgeId":12314
+    "bridgeId":12314,
+    "statsInterval": 60,
+    "connIdleTimeout": 0,
+    "maxConnsPerPort": 0,
+    "maxConns": 0
 }
