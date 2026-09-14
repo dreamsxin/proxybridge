@@ -62,6 +62,20 @@ func main() {
 	// 缺失项用缺省值兜底，尤其是日志轮转：没有上界的日志迟早把磁盘写满
 	config.Cfg.ApplyDefaults()
 	printServiceEndpoints()
+
+	// 单实例互斥必须在 initLog 之前。第二个实例即使桥端口和管理端口全都绑不上
+	// 也不会退出，而它照样会写同一份 bridge.db（全量覆盖，后写者赢）和同一份日志。
+	// lumberjack 是惰性打开的：第一次 Write 才 openExistingOrNew，紧接着按大小
+	// 判定 rotate。所以只要第二个实例往共享日志里写过一行（哪怕就是这条拒绝启动
+	// 的日志），就可能触发一次 rename，把第一个实例的 fd 带进归档文件——日志从此
+	// 静默丢失。拿锁失败的信息因此走 stderr，不碰日志文件。
+	lock, err := acquireInstanceLock()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bridge-direct refusing to start: %v\n", err)
+		os.Exit(1)
+	}
+	defer lock.Release()
+
 	//初始化日志
 	initLog()
 
@@ -71,16 +85,6 @@ func main() {
 		slog.Error("invalid aes key length, want 16/24/32", "length", n)
 		os.Exit(1)
 	}
-
-	// 单实例互斥必须在起任何服务之前。第二个实例即使桥端口和管理端口全都绑不上
-	// 也不会退出，而它照样会写同一份 bridge.db（全量覆盖，后写者赢）和同一份日志
-	// （轮转 rename 之后另一方的句柄跟进归档文件，日志静默丢失），两种损坏都不报错。
-	lock, err := acquireInstanceLock()
-	if err != nil {
-		slog.Error("refusing to start", "err", err)
-		os.Exit(1)
-	}
-	defer lock.Release()
 
 	slog.Info("bridge-direct starting", "version", VERSION, "mode", config.Cfg.Mode)
 

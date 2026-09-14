@@ -44,8 +44,13 @@ func New(filename string) (*CacheF, error) {
 			return nil, err
 		}
 		// 首次启动：立刻把空文件建出来，目录权限之类的问题在启动时就暴露，
-		// 而不是等到第一次 /bridge/add 才失败
-		if err := cf.dump(); err != nil {
+		// 而不是等到第一次 /bridge/add 才失败。
+		// dump 的契约是「调用方必须持有写锁」，这里虽然还没有别的持有者，
+		// 也照约定加锁：否则以后任何一次「New 之后并发」的改动都会静默违约。
+		cf.rwm.Lock()
+		err := cf.dump()
+		cf.rwm.Unlock()
+		if err != nil {
 			return nil, err
 		}
 		return cf, nil

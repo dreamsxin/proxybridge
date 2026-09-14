@@ -380,10 +380,18 @@ func validateBridge(bridge dto.UseBridge) error {
 	return nil
 }
 
-// selfPorts 返回本进程自己占着的端口。撞上这些端口必须在入口拒掉：
-// 它们不在 runListens 里，走不到「己方桥占用 → 只换目标」的路径，
-// 而 bind 又永远不可能成功（同进程同端口不能二次 bind），
-// 放进去的结果只是 supervisor 无限退避重试 + 刷 error 日志。
+// selfPorts 返回本进程自己占着的端口（管理/pprof/metrics）。桥必须拒绝这些端口。
+//
+// 注意 bind 冲突的真实语义：只有 wildcard-vs-wildcard 才真冲突。
+// 已占 0.0.0.0:P 再 bind 0.0.0.0:P 会失败，但「已占 127.0.0.1:P 再 bind
+// 0.0.0.0:P」和「已占 0.0.0.0:P 再 bind 127.0.0.1:P」都会成功——Go 在 Unix 上
+// 给 listener 默认开了 SO_REUSEADDR，内核允许具体地址与通配地址共存。
+//
+// 所以不能指望「bind 自然会失败」来兜底：
+//   - addr=":5678" 时桥的通配 bind 确实失败，supervisor 会无限退避重试刷日志；
+//   - addr="127.0.0.1:5678"（README 推荐 pprof/metrics 绑回环）时两个 listener
+//     并存，回环连接由更具体的地址接管，管理 API 看起来完全正常，而桥顺手把这个
+//     端口在所有非回环网卡上变成了一个无认证的中继入口。后者静默、不告警。
 func selfPorts() map[uint16]string {
 	ports := make(map[uint16]string, 2)
 	if p, ok := portFromAddr(config.Cfg.Addr); ok {

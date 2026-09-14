@@ -24,6 +24,10 @@ const (
 	// bind / accept 失败后的退避区间
 	retryMin = 50 * time.Millisecond
 	retryMax = 5 * time.Second
+
+	// listenStableFor 是「这次监听算稳定服务过」的门槛。只有跑够这么久再退出，
+	// 才把退避归零；否则 EMFILE 这类持续故障会退化成 50ms 的热循环。
+	listenStableFor = retryMax
 )
 
 // globalConnSem 是进程级并发连接配额，nil 表示不限制。
@@ -96,20 +100,25 @@ type bridgeListener struct {
 	// bindErr 保存最近一次 bind 失败原因，bind 成功后清空。
 	// 管理接口要据此回报「为什么没监听上」，光记日志不够。
 	bindErr atomic.Pointer[string]
+	// notify 里的 channel 在每次状态变化（bind 成功/失败、停止监听、主动下线）时
+	// 关闭并换新，供 WaitBridgeListening 等待，替掉原来的 10ms 轮询——轮询是在
+	// 持有端口锁的情况下做的，最坏要占满整个 listenReadyTimeout。
+	notify atomic.Pointer[chan struct{}]
 
-	accepted       atomic.Int64
-	rejected       atomic.Int64
-	rejectedGlobal atomic.Int64
-	rejectedPort   atomic.Int64
-	dialOK         atomic.Int64
-	dialFail       atomic.Int64
-	bindErrors     atomic.Int64
-	acceptErrors   atomic.Int64
-	relayUpBytes   atomic.Int64
-	relayDownBytes atomic.Int64
-	dialDurationNs atomic.Int64
-	dialCount      atomic.Uint64
-	dialBuckets    [dialDurationBucketCount]atomic.Uint64
+	accepted        atomic.Int64
+	rejected        atomic.Int64
+	rejectedGlobal  atomic.Int64
+	rejectedPort    atomic.Int64
+	rejectedClosing atomic.Int64
+	dialOK          atomic.Int64
+	dialFail        atomic.Int64
+	bindErrors      atomic.Int64
+	acceptErrors    atomic.Int64
+	relayUpBytes    atomic.Int64
+	relayDownBytes  atomic.Int64
+	dialDurationNs  atomic.Int64
+	dialCount       atomic.Uint64
+	dialBuckets     [dialDurationBucketCount]atomic.Uint64
 
 	// lmu 保护 listener；bind 重试期间为 nil
 	lmu      sync.Mutex
@@ -127,7 +136,28 @@ func newBridgeListener(toAddr string) *bridgeListener {
 		connSet: make(map[net.Conn]struct{}),
 	}
 	l.target.Store(&toAddr)
+	ch := make(chan struct{})
+	l.notify.Store(&ch)
 	return l
+}
+
+// stateChanged 返回一个在下一次状态变化时被关闭的 channel。
+// 等待方必须先取 channel、再判定状态，顺序反了会漏掉「判定之后、等待之前」
+// 发生的那次变化，然后一直等到超时。
+func (l *bridgeListener) stateChanged() <-chan struct{} {
+	if p := l.notify.Load(); p != nil {
+		return *p
+	}
+	closed := make(chan struct{})
+	close(closed)
+	return closed
+}
+
+func (l *bridgeListener) notifyStateChange() {
+	next := make(chan struct{})
+	if old := l.notify.Swap(&next); old != nil {
+		close(*old)
+	}
 }
 
 func (l *bridgeListener) currentTarget() string {
@@ -144,6 +174,7 @@ func (l *bridgeListener) setTarget(toAddr string) {
 func (l *bridgeListener) setBindErr(err error) {
 	s := err.Error()
 	l.bindErr.Store(&s)
+	l.notifyStateChange()
 }
 
 func (l *bridgeListener) clearBindErr() {
@@ -169,6 +200,7 @@ func (l *bridgeListener) stop() {
 		}
 		l.listening.Store(false)
 		l.lmu.Unlock()
+		l.notifyStateChange()
 	})
 }
 
@@ -184,6 +216,7 @@ func (l *bridgeListener) installListener(ln net.Listener) bool {
 	}
 	l.listener = ln
 	l.listening.Store(true)
+	l.notifyStateChange()
 	return true
 }
 
@@ -192,22 +225,34 @@ func (l *bridgeListener) clearListener() {
 	l.listener = nil
 	l.listening.Store(false)
 	l.lmu.Unlock()
+	l.notifyStateChange()
 }
 
-// addConn 登记一条在途连接。返回 false 表示已停止服务或撞上限额，
-// 此时全局配额已经归还，调用方只需要关掉连接。
-func (l *bridgeListener) addConn(c net.Conn) bool {
+// addConnResult 区分「桥正在下线」和「撞上单端口限额」。
+// 两者都要关掉连接，但混成一个 false 会让 port_limit 计数和告警把下线期间的
+// 正常丢弃也算成限额打满，排查时完全被带偏。
+type addConnResult int
+
+const (
+	addConnOK addConnResult = iota
+	addConnClosing
+	addConnLimit
+)
+
+// addConn 登记一条在途连接。返回非 addConnOK 时全局配额已经归还，
+// 调用方只需要关掉连接。
+func (l *bridgeListener) addConn(c net.Conn) addConnResult {
 	limit := maxConnsPerPort()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.connSet == nil {
-		return false
+		return addConnClosing
 	}
 	if limit > 0 && len(l.connSet) >= limit {
-		return false
+		return addConnLimit
 	}
 	l.connSet[c] = struct{}{}
-	return true
+	return addConnOK
 }
 
 func (l *bridgeListener) removeConn(c net.Conn) {
@@ -268,7 +313,15 @@ func InitBridgeHandler() {
 //
 // 新建桥时会起一个 supervisor：bind 失败不再是一次性放弃，而是退避重试到成功，
 // 直到 DelBridgeHandler 取消。
+//
+// 撞上本进程自己的端口（管理/pprof/metrics）在这里统一拒掉，而不是只在
+// /bridge/add 的入口校验：InitBridgeHandler（启动时按 bridge.db 恢复，含中心
+// 同步下来的记录）和 StartBridge 都会走到这里，只在 API 入口拦是拦不住的。
 func SetBridgeHandler(port uint16, toAddr string) error {
+	if who, ok := selfPorts()[port]; ok {
+		return fmt.Errorf("port %d conflicts with %s", port, who)
+	}
+
 	runMu.Lock()
 	if l, ok := runListens[port]; ok && !l.closed.Load() {
 		old := l.currentTarget()
@@ -307,6 +360,10 @@ func hasBridgeHandler(port uint16) bool {
 //
 // supervisor 是异步起的，SetBridgeHandler 返回 nil 只代表「已接管这个端口」，
 // 不代表 bind 成功；管理接口需要据此如实报错，而不是一律说成功。
+//
+// 用状态变化通知而不是轮询：调用方（AddBridge/StartBridge）是持着端口锁进来的，
+// 轮询会把这把锁按 timeout 上限占住。bind 已经失败过一次就立刻回报——原因此刻
+// 就是准确的，没必要把调用方吊到超时，supervisor 仍会在后台退避重试。
 func WaitBridgeListening(port uint16, timeout time.Duration) (bool, string) {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -316,17 +373,38 @@ func WaitBridgeListening(port uint16, timeout time.Duration) (bool, string) {
 		if !ok {
 			return false, "bridge was removed"
 		}
+
+		changed := l.stateChanged()
 		if !l.closed.Load() && l.listening.Load() {
 			return true, ""
 		}
-		if time.Now().After(deadline) {
+		if bindErr := l.lastBindErr(); bindErr != "" {
+			return false, bindErr
+		}
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
 			return false, l.lastBindErr()
 		}
-		time.Sleep(10 * time.Millisecond)
+		timer := time.NewTimer(remaining)
+		select {
+		case <-changed:
+		case <-timer.C:
+		}
+		timer.Stop()
 	}
 }
 
-// BridgeStats 返回运行水位，用于判断是否存在泄漏
+// BridgeStats 返回运行水位，用于判断是否存在泄漏。
+//
+// 计数口径（Accepted 与 Rejected 有重叠，别相减当「成功连接数」用之外的解读）：
+//   - Accepted：accept 成功的次数，在配额判定之前累加，所以包含随后被
+//     全局/端口限额拒掉、以及桥下线期间丢弃的连接。这是内核视角的真实到达量。
+//   - Rejected：accept 之后被我们主动关掉的连接，按 global_limit / port_limit /
+//     closing 三种原因细分（细分值在 metrics 里）。
+//   - 真正进入转发的连接数 = Accepted - Rejected；当前在途连接是 Conns。
+//
+// 另外这些累计值挂在各自的 listener 上，桥被删除时一起消失，所以求和结果会变小。
 type BridgeStats struct {
 	Bridges   int
 	Listening int
@@ -346,6 +424,7 @@ type bridgeMetricSnapshot struct {
 	Accepted            int64
 	RejectedGlobal      int64
 	RejectedPort        int64
+	RejectedClosing     int64
 	DialOK              int64
 	DialFail            int64
 	BindErrors          int64
@@ -358,18 +437,19 @@ type bridgeMetricSnapshot struct {
 }
 
 type bridgeMetricTotals struct {
-	Accepted       atomic.Uint64
-	RejectedGlobal atomic.Uint64
-	RejectedPort   atomic.Uint64
-	DialOK         atomic.Uint64
-	DialFail       atomic.Uint64
-	BindErrors     atomic.Uint64
-	AcceptErrors   atomic.Uint64
-	RelayUpBytes   atomic.Uint64
-	RelayDownBytes atomic.Uint64
-	DialDurationNs atomic.Uint64
-	DialCount      atomic.Uint64
-	DialBuckets    [dialDurationBucketCount]atomic.Uint64
+	Accepted        atomic.Uint64
+	RejectedGlobal  atomic.Uint64
+	RejectedPort    atomic.Uint64
+	RejectedClosing atomic.Uint64
+	DialOK          atomic.Uint64
+	DialFail        atomic.Uint64
+	BindErrors      atomic.Uint64
+	AcceptErrors    atomic.Uint64
+	RelayUpBytes    atomic.Uint64
+	RelayDownBytes  atomic.Uint64
+	DialDurationNs  atomic.Uint64
+	DialCount       atomic.Uint64
+	DialBuckets     [dialDurationBucketCount]atomic.Uint64
 }
 
 var metricTotals bridgeMetricTotals
@@ -389,22 +469,23 @@ func collectBridgeMetricSnapshots() []bridgeMetricSnapshot {
 	snapshots := make([]bridgeMetricSnapshot, 0, len(ls))
 	for _, l := range ls {
 		snapshot := bridgeMetricSnapshot{
-			BridgePort:     l.port,
-			ProxyAddr:      l.currentTarget(),
-			Running:        true,
-			Listening:      !l.closed.Load() && l.listening.Load(),
-			Conns:          l.connCount(),
-			Accepted:       l.accepted.Load(),
-			RejectedGlobal: l.rejectedGlobal.Load(),
-			RejectedPort:   l.rejectedPort.Load(),
-			DialOK:         l.dialOK.Load(),
-			DialFail:       l.dialFail.Load(),
-			BindErrors:     l.bindErrors.Load(),
-			AcceptErrors:   l.acceptErrors.Load(),
-			RelayUpBytes:   l.relayUpBytes.Load(),
-			RelayDownBytes: l.relayDownBytes.Load(),
-			DialDurationNs: l.dialDurationNs.Load(),
-			DialCount:      l.dialCount.Load(),
+			BridgePort:      l.port,
+			ProxyAddr:       l.currentTarget(),
+			Running:         true,
+			Listening:       !l.closed.Load() && l.listening.Load(),
+			Conns:           l.connCount(),
+			Accepted:        l.accepted.Load(),
+			RejectedGlobal:  l.rejectedGlobal.Load(),
+			RejectedPort:    l.rejectedPort.Load(),
+			RejectedClosing: l.rejectedClosing.Load(),
+			DialOK:          l.dialOK.Load(),
+			DialFail:        l.dialFail.Load(),
+			BindErrors:      l.bindErrors.Load(),
+			AcceptErrors:    l.acceptErrors.Load(),
+			RelayUpBytes:    l.relayUpBytes.Load(),
+			RelayDownBytes:  l.relayDownBytes.Load(),
+			DialDurationNs:  l.dialDurationNs.Load(),
+			DialCount:       l.dialCount.Load(),
 		}
 		for i := range snapshot.DialDurationBuckets {
 			snapshot.DialDurationBuckets[i] = l.dialBuckets[i].Load()
@@ -522,11 +603,14 @@ func (l *bridgeListener) supervise(port uint16, fn func(conn net.Conn, toAddr st
 			continue
 		}
 
-		backoff = 0
+		// 注意这里不把 backoff 归零：bind 成功不等于故障消失，accept 可能立刻
+		// 因为同一个原因（EMFILE 等）退出。归零的判定放在 nextRebindBackoff 里，
+		// 以「这次监听是否稳定服务过」为准。
 		l.clearBindErr()
 		if !l.installListener(ln) {
 			return
 		}
+		listenStarted := time.Now()
 		slog.Info("listen", "port", port, "toAddr", l.currentTarget())
 
 		acceptErr := l.acceptLoop(port, ln, fn)
@@ -537,9 +621,9 @@ func (l *bridgeListener) supervise(port uint16, fn func(conn net.Conn, toAddr st
 		if l.stopRequested() {
 			return
 		}
-		backoff = nextBackoff(backoff)
+		backoff = nextRebindBackoff(backoff, time.Since(listenStarted))
 		slog.Error("accept loop exited, rebinding", "port", port,
-			"backoff", backoff, "err", acceptErr)
+			"backoff", backoff, "uptime", time.Since(listenStarted), "err", acceptErr)
 		if !l.sleepOrStop(backoff) {
 			return
 		}
@@ -579,7 +663,16 @@ func (l *bridgeListener) acceptLoop(port uint16, ln net.Listener, fn func(conn n
 			conn.Close()
 			continue
 		}
-		if !l.addConn(conn) {
+		switch l.addConn(conn) {
+		case addConnOK:
+		case addConnClosing:
+			releaseGlobalConn()
+			recordRejected(l, "closing")
+			slog.Info("conn dropped, bridge is shutting down", "port", port,
+				"srcaddr", conn.RemoteAddr().String())
+			conn.Close()
+			continue
+		case addConnLimit:
 			releaseGlobalConn()
 			recordRejected(l, "port_limit")
 			slog.Warn("conn rejected by port limit", "port", port,
@@ -619,7 +712,7 @@ func (l *bridgeListener) sleepOrStop(d time.Duration) bool {
 }
 
 func nextBackoff(cur time.Duration) time.Duration {
-	if cur == 0 {
+	if cur <= 0 {
 		return retryMin
 	}
 	next := cur * 2
@@ -627,6 +720,19 @@ func nextBackoff(cur time.Duration) time.Duration {
 		return retryMax
 	}
 	return next
+}
+
+// nextRebindBackoff 决定 accept 循环退出后、重建 listener 之前等多久。
+// uptime 是这次监听存活的时间：只有稳定服务过 listenStableFor 才认为故障已经
+// 恢复、可以从最小值重新开始；否则在上一次的基础上继续指数增长。
+//
+// 之前的写法是 bind 成功就把 backoff 归零，于是「bind 成功 → accept 立刻失败」
+// 这种持续故障永远只退避 50ms，指数退避形同虚设。
+func nextRebindBackoff(cur, uptime time.Duration) time.Duration {
+	if uptime >= listenStableFor {
+		return retryMin
+	}
+	return nextBackoff(cur)
 }
 
 func handlerBridge(conn net.Conn, toAddr string) {
@@ -717,9 +823,13 @@ func recordRejected(l *bridgeListener, reason string) {
 			l.rejectedGlobal.Add(1)
 		case "port_limit":
 			l.rejectedPort.Add(1)
+		case "closing":
+			l.rejectedClosing.Add(1)
 		}
 	}
 	switch reason {
+	case "closing":
+		metricTotals.RejectedClosing.Add(1)
 	case "global_limit":
 		metricTotals.RejectedGlobal.Add(1)
 	case "port_limit":

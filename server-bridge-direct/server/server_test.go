@@ -359,8 +359,8 @@ func TestBindFailureReportsErrorAndKeepsRetrying(t *testing.T) {
 	assertProxyResponse(t, bridgePort, "first")
 }
 
-// 撞上本进程自己的端口（管理端口/pprof）必须在入口拒掉：
-// 这类冲突 bind 永远不可能成功，放进去只会让 supervisor 无限重试
+// 撞上本进程自己的端口（管理端口/pprof）必须拒掉：管理地址绑回环时，桥的通配
+// bind 会成功并与之共存，等于把该端口在所有非回环网卡上变成无认证中继入口
 func TestAddBridgeRejectsSelfPortConflict(t *testing.T) {
 	setupServerTest(t)
 
@@ -388,6 +388,36 @@ func TestAddBridgeRejectsSelfPortConflict(t *testing.T) {
 		}
 		if got := bridgeListenerCount(port); got != 0 {
 			t.Fatalf("port %d: rejected add left %d listeners, want 0", port, got)
+		}
+	}
+}
+
+// /bridge/add 之外的两条起桥路径也必须拒绝自有端口：
+// InitBridgeHandler（启动时按 bridge.db 恢复，含中心同步下来的记录）和
+// StartBridge 都直接调 SetBridgeHandler，只在 API 入口校验拦不住它们
+func TestSetBridgeHandlerRejectsSelfPort(t *testing.T) {
+	setupServerTest(t)
+
+	prevAddr, prevPprof, prevMetrics := config.Cfg.Addr, config.Cfg.PprofAddr, config.Cfg.MetricsAddr
+	config.Cfg.Addr = "127.0.0.1:18081"
+	config.Cfg.PprofAddr = "127.0.0.1:16061"
+	config.Cfg.MetricsAddr = ":19091"
+	t.Cleanup(func() {
+		config.Cfg.Addr, config.Cfg.PprofAddr, config.Cfg.MetricsAddr = prevAddr, prevPprof, prevMetrics
+	})
+
+	target := startTCPServer(t, "first")
+
+	for _, port := range []uint16{18081, 16061, 19091} {
+		err := SetBridgeHandler(port, fmt.Sprintf("%s:%d", target.host, target.port))
+		if err == nil {
+			t.Fatalf("port %d: SetBridgeHandler must reject our own port", port)
+		}
+		if !strings.Contains(err.Error(), "conflicts with") {
+			t.Fatalf("port %d: err = %v, want a conflict explanation", port, err)
+		}
+		if got := bridgeListenerCount(port); got != 0 {
+			t.Fatalf("port %d: rejected start left %d listeners, want 0", port, got)
 		}
 	}
 }
@@ -690,6 +720,124 @@ func TestAcceptLoopRetriesTransientErrors(t *testing.T) {
 	}
 	if got := fl.callCount(); got != 3 {
 		t.Fatalf("Accept called %d times, want 3 (two retries then ErrClosed)", got)
+	}
+}
+
+// accept 循环反复秒退（EMFILE 之类的持续故障）时退避必须继续增长。
+// 之前 bind 成功就把 backoff 归零，导致这条路径永远只等 50ms。
+func TestNextRebindBackoffGrowsUntilListenerIsStable(t *testing.T) {
+	var backoff time.Duration
+	want := []time.Duration{
+		50 * time.Millisecond,
+		100 * time.Millisecond,
+		200 * time.Millisecond,
+		400 * time.Millisecond,
+		800 * time.Millisecond,
+		1600 * time.Millisecond,
+		3200 * time.Millisecond,
+		retryMax,
+		retryMax,
+	}
+	for i, expect := range want {
+		backoff = nextRebindBackoff(backoff, 0)
+		if backoff != expect {
+			t.Fatalf("step %d: backoff = %v, want %v", i, backoff, expect)
+		}
+	}
+
+	// 稳定服务过 listenStableFor 才算故障恢复，可以从最小值重新开始
+	if got := nextRebindBackoff(backoff, listenStableFor); got != retryMin {
+		t.Fatalf("after a stable run backoff = %v, want %v", got, retryMin)
+	}
+}
+
+// 桥下线期间丢弃的连接不能记成 port_limit，否则限额告警会被带偏
+func TestAddConnDistinguishesClosingFromLimit(t *testing.T) {
+	prev := config.Cfg.MaxConnsPerPort
+	config.Cfg.MaxConnsPerPort = 1
+	t.Cleanup(func() { config.Cfg.MaxConnsPerPort = prev })
+
+	l := newBridgeListener("127.0.0.1:1")
+
+	first, _ := net.Pipe()
+	if got := l.addConn(first); got != addConnOK {
+		t.Fatalf("first addConn = %v, want addConnOK", got)
+	}
+	second, _ := net.Pipe()
+	if got := l.addConn(second); got != addConnLimit {
+		t.Fatalf("addConn over the limit = %v, want addConnLimit", got)
+	}
+
+	l.closeConns()
+	third, _ := net.Pipe()
+	if got := l.addConn(third); got != addConnClosing {
+		t.Fatalf("addConn while closing = %v, want addConnClosing", got)
+	}
+}
+
+// bind 已经失败过就立刻回报，不把持着端口锁的调用方吊到超时
+func TestWaitBridgeListeningReportsBindErrorImmediately(t *testing.T) {
+	port := freeTCPPort(t)
+	l := newBridgeListener("127.0.0.1:1")
+	l.port = port
+	l.setBindErr(errors.New("listen tcp :0: bind: address already in use"))
+
+	runMu.Lock()
+	runListens[port] = l
+	runMu.Unlock()
+	t.Cleanup(func() {
+		runMu.Lock()
+		delete(runListens, port)
+		runMu.Unlock()
+	})
+
+	started := time.Now()
+	ok, msg := WaitBridgeListening(port, 5*time.Second)
+	elapsed := time.Since(started)
+	if ok {
+		t.Fatal("WaitBridgeListening returned ok for a listener that failed to bind")
+	}
+	if !strings.Contains(msg, "address already in use") {
+		t.Fatalf("msg = %q, want the bind error", msg)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("waited %v for a known bind failure, want an immediate answer", elapsed)
+	}
+}
+
+// 状态变化通知必须叫醒等待方，而不是靠轮询兜底
+func TestWaitBridgeListeningWakesOnListenSuccess(t *testing.T) {
+	port := freeTCPPort(t)
+	l := newBridgeListener("127.0.0.1:1")
+	l.port = port
+
+	runMu.Lock()
+	runListens[port] = l
+	runMu.Unlock()
+	t.Cleanup(func() {
+		runMu.Lock()
+		delete(runListens, port)
+		runMu.Unlock()
+	})
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		l.installListener(ln)
+	}()
+
+	started := time.Now()
+	ok, msg := WaitBridgeListening(port, 5*time.Second)
+	if !ok {
+		t.Fatalf("WaitBridgeListening = false (%q), want true once the listener is installed", msg)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("waited %v after the listener came up, want a prompt wakeup", elapsed)
 	}
 }
 
