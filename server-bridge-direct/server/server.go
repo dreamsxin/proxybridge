@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof" // 仅在配置了 pprofAddr 时才对外提供
+	"os"
 	"runtime/debug"
 	"strconv"
 	"sync"
@@ -89,7 +90,11 @@ func Start() {
 	}
 	slog.Info("management server listening", "addr", config.Cfg.Addr, "mode", config.Cfg.Mode)
 	if err := r.Run(config.Cfg.Addr); err != nil {
-		slog.Error("management server exited", "addr", config.Cfg.Addr, "err", err)
+		// 这里必须结束进程。端口被别人占着，重试没有意义，而只记日志的话进程会
+		// 变成一个「桥还在转发但完全不可管理」的僵尸：加桥、删桥、查状态全都没有
+		// 入口，外部也没有任何可探测的迹象。直接退出让 systemd 拉起并暴露故障。
+		slog.Error("management server failed to serve, exiting", "addr", config.Cfg.Addr, "err", err)
+		os.Exit(1)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/baowk/bridge-direct/config"
 	"github.com/baowk/bridge-direct/server"
+	"github.com/baowk/bridge-direct/utils"
 	"github.com/spf13/viper"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -71,6 +72,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 单实例互斥必须在起任何服务之前。第二个实例即使桥端口和管理端口全都绑不上
+	// 也不会退出，而它照样会写同一份 bridge.db（全量覆盖，后写者赢）和同一份日志
+	// （轮转 rename 之后另一方的句柄跟进归档文件，日志静默丢失），两种损坏都不报错。
+	lock, err := acquireInstanceLock()
+	if err != nil {
+		slog.Error("refusing to start", "err", err)
+		os.Exit(1)
+	}
+	defer lock.Release()
+
 	slog.Info("bridge-direct starting", "version", VERSION, "mode", config.Cfg.Mode)
 
 	go server.Start()
@@ -79,6 +90,25 @@ func main() {
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	sig := <-quit
 	slog.Info("bridge-direct shutting down", "signal", sig.String())
+}
+
+// instanceLockPath 锁文件路径。跟着 dataFilename 走，因为要互斥的正是对这份
+// 文件的写入；dataFilename 没配时用默认名，保持和 cachef 的默认落盘位置一致。
+func instanceLockPath() string {
+	name := config.Cfg.DataFilename
+	if name == "" {
+		name = "bridge.db"
+	}
+	return name + ".lock"
+}
+
+func acquireInstanceLock() (*utils.InstanceLock, error) {
+	path := instanceLockPath()
+	lock, err := utils.AcquireInstanceLock(path)
+	if err != nil {
+		return nil, fmt.Errorf("instance lock %s: %w", path, err)
+	}
+	return lock, nil
 }
 
 // printServiceEndpoints is intentionally stdout-based. Operators need to see
