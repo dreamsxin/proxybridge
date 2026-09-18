@@ -245,6 +245,7 @@ Invoke-RestMethod 'http://127.0.0.1:5678/bridge/status?bridgePort=10000&check=1'
       "bridgePort": 10000,
       "proxyAddr": "192.0.2.10:1080",
       "listening": true,
+      "checked": true,
       "bridgeTcp": true,
       "proxyTcp": true,
       "ok": true,
@@ -278,6 +279,7 @@ Invoke-RestMethod 'http://127.0.0.1:5678/bridge/status?bridgePort=10000&check=1'
 | `bridgePort` | number | bridge 对外监听端口。 |
 | `proxyAddr` | string | 当前目标代理地址，格式为 `ip:port`。 |
 | `listening` | boolean | listener 是否已经成功绑定并处于监听状态。bind 重试期间为 `false`。 |
+| `checked` | boolean | 是否执行了 `check=1` 的 bridge/proxy TCP 探测。 |
 | `bridgeTcp` | boolean | `check=1` 时对本机 bridge 端口的 TCP 探测结果；未开启探测时为默认值 `false`。 |
 | `proxyTcp` | boolean | `check=1` 时对目标代理地址的 TCP 探测结果；未开启探测时为默认值 `false`。 |
 | `ok` | boolean | 只有 `listening=true`，且在 `check=1` 时 bridge/proxy TCP 探测均成功才为 `true`。 |
@@ -287,9 +289,9 @@ Invoke-RestMethod 'http://127.0.0.1:5678/bridge/status?bridgePort=10000&check=1'
 | `failureReason` | string | 面向运维的失败原因汇总。 |
 | `solution` | string | 面向运维的处理建议。 |
 
-不带 `check` 时不会执行网络探测，因此 `bridgeTcp`、`proxyTcp`、`ok` 不能用于判断目标代理
-当前是否可连接；这可以避免频繁轮询 status 时产生额外连接。需要连通性诊断时再使用
-`check=1`，并控制调用频率。
+不带 `check` 时不会执行网络探测，此时 `checked=false`，`bridgeTcp`、`proxyTcp`、`ok` 都不代表
+失败，只表示尚未检查；`bridge-info` 会显示 `health=not_checked`。这可以避免频繁轮询 status
+时产生额外连接。需要连通性诊断时再使用 `check=1`，并控制调用频率。
 
 `stats` 进程和 bridge 统计字段：
 
@@ -573,6 +575,17 @@ python .\scripts\test_socks5_proxies.py `
 `target_response_invalid` 和 `success`；失败进度行和最终汇总后的失败明细都会打印具体的 `reason` 及出现次数。报告只保存脱敏后的
 主机端口、认证状态、失败原因和出口 IP，不会保存用户名或密码；全部成功时退出码为 `0`，
 存在失败时退出码为 `1`。
+
+失败代理的控制台明细还会输出 `proxy_ip`、`proxy_port` 和 `account`（用户名），例如：
+
+```text
+proxy-check failed proxies:
+  proxy_ip=64.144.22.25 proxy_port=5206 account=demo-user category=auth_failed count=2 reason=SOCKS5 username/password authentication failed: status=0x01 (1), general SOCKS server failure, raw=01 01
+```
+
+这里的 `account` 只显示用户名，不显示密码；`proxy_ip` 是代理 URL 中的主机/IP，端口单独列出，
+便于在源代理文件中定位记录。若代理地址格式本身无效，无法解析出的字段显示为 `<unknown>` 或
+`<none>`。JSON 报告仍不会保存用户名或密码。
 
 `auth_failed` 只有在 SOCKS5 服务器明确选择用户名/密码认证（方法 `0x02`），并返回非零认证
 状态码时才会产生。输出中的 `status=0xNN` 和 `raw=01 NN` 是 SOCKS5 子协商的原始字节；协议

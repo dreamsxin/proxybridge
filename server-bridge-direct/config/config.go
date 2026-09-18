@@ -22,6 +22,9 @@ const (
 	DefaultLogMaxSizeMB  = 100
 	DefaultLogMaxAgeDays = 7
 	DefaultLogMaxBackups = 10
+	// DefaultDialTimeoutSeconds 拨号到上游的缺省超时。沿用改成可配之前的硬编码值，
+	// 保证升级后行为不变
+	DefaultDialTimeoutSeconds = 10
 )
 
 type Config struct {
@@ -58,6 +61,11 @@ type Config struct {
 	// ConnIdleTimeout 单连接空闲超时(秒)，0=不限制。
 	// 浏览器SOCKS5场景注意：设太小会掐掉连接池里的空闲socket和WebSocket长连接
 	ConnIdleTimeout int `json:"connIdleTimeout"`
+	// DialTimeout 拨号到上游目标的超时(秒)，缺省 10。
+	// 只覆盖 TCP 握手阶段：SOCKS5 的方法协商、认证、CONNECT 都在握手之后，
+	// 属于被透传的 payload，不受它约束。上游经常「慢拒绝」（等到 7~10 秒才回
+	// CONNECT 失败），调小能让失败更快返回、少占一条 fd 和一个 goroutine
+	DialTimeout int `json:"dialTimeout"`
 	// MaxConnsPerPort 单个桥端口最大并发连接数，0=不限制。
 	// 作用是给fd用量兜底，先用statsInterval观测真实水位再定值
 	MaxConnsPerPort int `json:"maxConnsPerPort"`
@@ -87,6 +95,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.LogMaxBackups <= 0 {
 		c.LogMaxBackups = DefaultLogMaxBackups
+	}
+	if c.DialTimeout <= 0 {
+		c.DialTimeout = DefaultDialTimeoutSeconds
 	}
 }
 

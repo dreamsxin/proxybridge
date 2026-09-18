@@ -6,8 +6,10 @@ column is used) or a TXT file containing one proxy URL per line.  The script
 implements the SOCKS5 handshake with the Python standard library, so no
 third-party package such as requests[socks] is required.
 
-Credentials are never printed.  A report, when requested, only contains a
-redacted proxy address (host and port) and the observed exit IP.
+Passwords are never printed. Failed console diagnostics include the proxy
+host/port and username so the source entry can be located. A report, when
+requested, only contains a redacted proxy address (host and port) and the
+observed exit IP.
 """
 
 from __future__ import annotations
@@ -68,6 +70,9 @@ class TestResult:
     auth: str = ""
     elapsed_ms: int = 0
     attempt: int = 1
+    proxy_ip: str = ""
+    proxy_port: int = 0
+    account: str = ""
 
 
 def read_proxy_values(path: Path) -> list[str]:
@@ -268,9 +273,15 @@ def test_one(
     display = f"proxy#{index}"
     auth = ""
     exit_ip = ""
+    proxy_ip = ""
+    proxy_port = 0
+    account = ""
     try:
         spec = parse_proxy(value)
         display = spec.display
+        proxy_ip = spec.host
+        proxy_port = spec.port
+        account = spec.username or ""
         target_host, target_port, target_path, use_tls = target
         with socket.create_connection((spec.host, spec.port), timeout=timeout) as sock:
             sock.settimeout(timeout)
@@ -291,19 +302,19 @@ def test_one(
             ipaddress.ip_address(exit_ip)
         except (UnicodeDecodeError, json.JSONDecodeError, AttributeError, ValueError, TypeError) as exc:
             raise ProxyTestError("target_response_invalid", "target response has no valid Ip field") from exc
-        return TestResult(index, display, "success", "success", "ok", exit_ip, auth, elapsed_ms(started), attempt)
+        return TestResult(index, display, "success", "success", "ok", exit_ip, auth, elapsed_ms(started), attempt, proxy_ip, proxy_port, account)
     except ProxyTestError as exc:
-        return TestResult(index, display, "failed", exc.category, str(exc), exit_ip, auth, elapsed_ms(started), attempt)
+        return TestResult(index, display, "failed", exc.category, str(exc), exit_ip, auth, elapsed_ms(started), attempt, proxy_ip, proxy_port, account)
     except socket.gaierror as exc:
-        return TestResult(index, display, "failed", "proxy_dns_failed", str(exc), exit_ip, auth, elapsed_ms(started), attempt)
+        return TestResult(index, display, "failed", "proxy_dns_failed", str(exc), exit_ip, auth, elapsed_ms(started), attempt, proxy_ip, proxy_port, account)
     except (socket.timeout, TimeoutError) as exc:
-        return TestResult(index, display, "failed", "timeout", str(exc) or "timed out", exit_ip, auth, elapsed_ms(started), attempt)
+        return TestResult(index, display, "failed", "timeout", str(exc) or "timed out", exit_ip, auth, elapsed_ms(started), attempt, proxy_ip, proxy_port, account)
     except (ConnectionError, OSError) as exc:
-        return TestResult(index, display, "failed", "proxy_connect_failed", str(exc), exit_ip, auth, elapsed_ms(started), attempt)
+        return TestResult(index, display, "failed", "proxy_connect_failed", str(exc), exit_ip, auth, elapsed_ms(started), attempt, proxy_ip, proxy_port, account)
     except (http.client.HTTPException, ssl.SSLError) as exc:
-        return TestResult(index, display, "failed", "target_request_failed", str(exc), exit_ip, auth, elapsed_ms(started), attempt)
+        return TestResult(index, display, "failed", "target_request_failed", str(exc), exit_ip, auth, elapsed_ms(started), attempt, proxy_ip, proxy_port, account)
     except Exception as exc:  # noqa: BLE001 - preserve one result per proxy
-        return TestResult(index, display, "failed", "unexpected_error", str(exc), exit_ip, auth, elapsed_ms(started), attempt)
+        return TestResult(index, display, "failed", "unexpected_error", str(exc), exit_ip, auth, elapsed_ms(started), attempt, proxy_ip, proxy_port, account)
 
 
 def elapsed_ms(started: float) -> int:
@@ -323,10 +334,24 @@ def write_report(
         "timeout_seconds": timeout,
         "concurrency": concurrency,
         "requests_per_proxy": requests_per_proxy,
-        "results": [asdict(result) for result in results],
+        # Keep account/IP console diagnostics out of the report contract.
+        "results": [report_result(result) for result in results],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def report_result(result: TestResult) -> dict[str, object]:
+    value = asdict(result)
+    value.pop("proxy_ip", None)
+    value.pop("proxy_port", None)
+    value.pop("account", None)
+    return value
+
+
+def safe_console_text(value: str, fallback: str) -> str:
+    value = " ".join(value.split())
+    return value if value else fallback
 
 
 def main() -> int:
@@ -372,37 +397,53 @@ def main() -> int:
             results.append(result)
             suffix = f" ip={result.exit_ip}" if result.exit_ip else ""
             reason = ""
+            identity = ""
             if result.status != "success" and result.message:
                 # Keep one failed result on one console line; messages may
                 # contain newlines when they originate from a network error.
                 reason = f" reason={' '.join(result.message.split())}"
+                identity = (
+                    f" proxy_ip={safe_console_text(result.proxy_ip, '<unknown>')}"
+                    f" proxy_port={result.proxy_port or '<unknown>'}"
+                    f" account={safe_console_text(result.account, '<none>')}"
+                )
             print(
                 f"progress={len(results)}/{total_tests} proxy=#{result.index} "
                 f"attempt={result.attempt}/{args.requests_per_proxy} "
                 f"status={result.status} category={result.category} "
-                f"elapsed_ms={result.elapsed_ms}{suffix}{reason}"
+                f"elapsed_ms={result.elapsed_ms}{suffix}{identity}{reason}"
             )
 
     results.sort(key=lambda item: (item.index, item.attempt))
     counts: dict[str, int] = {}
-    failure_reasons: dict[tuple[str, str], int] = {}
+    failure_details: dict[tuple[str, int, str, str, str], int] = {}
     for result in results:
         counts[result.category] = counts.get(result.category, 0) + 1
         if result.status != "success" and result.message:
-            reason = " ".join(result.message.split())
-            key = (result.category, reason)
-            failure_reasons[key] = failure_reasons.get(key, 0) + 1
+            key = (
+                result.proxy_ip,
+                result.proxy_port,
+                result.account,
+                result.category,
+                " ".join(result.message.split()),
+            )
+            failure_details[key] = failure_details.get(key, 0) + 1
     summary = " ".join(f"{category}={counts[category]}" for category in sorted(counts))
     print(
         f"proxy-check summary proxies={len(values)} requestsPerProxy={args.requests_per_proxy} "
         f"total={len(results)} {summary}"
     )
-    if failure_reasons:
-        print("proxy-check failure reasons:")
-        for (category, reason), count in sorted(
-            failure_reasons.items(), key=lambda item: (-item[1], item[0][0], item[0][1])
+    if failure_details:
+        print("proxy-check failed proxies:")
+        for (proxy_ip, proxy_port, account, category, reason), count in sorted(
+            failure_details.items(), key=lambda item: (-item[1], item[0][3], item[0][4])
         ):
-            print(f"  category={category} count={count} reason={reason}")
+            print(
+                f"  proxy_ip={safe_console_text(proxy_ip, '<unknown>')} "
+                f"proxy_port={proxy_port or '<unknown>'} "
+                f"account={safe_console_text(account, '<none>')} "
+                f"category={category} count={count} reason={reason}"
+            )
     if args.report:
         write_report(args.report, results, args.url, args.timeout, args.concurrency, args.requests_per_proxy)
         print(f"proxy-check report={args.report}")

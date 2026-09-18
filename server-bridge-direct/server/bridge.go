@@ -18,8 +18,7 @@ const (
 	// DelBridgeHandler 在 HTTP handler 里同步调用，无上限等待会让请求永不返回。
 	stopTimeout = 10 * time.Second
 
-	// dialTimeout 只覆盖与目标建立连接的阶段
-	dialTimeout = 10 * time.Second
+	// dialTimeout 只覆盖与目标建立连接的阶段，见 dialTimeout()
 
 	// bind / accept 失败后的退避区间
 	retryMin = 50 * time.Millisecond
@@ -99,7 +98,8 @@ type bridgeListener struct {
 	target atomic.Pointer[string]
 	// bindErr 保存最近一次 bind 失败原因，bind 成功后清空。
 	// 管理接口要据此回报「为什么没监听上」，光记日志不够。
-	bindErr atomic.Pointer[string]
+	bindErr         atomic.Pointer[string]
+	portOwnerLogged atomic.Bool
 	// notify 里的 channel 在每次状态变化（bind 成功/失败、停止监听、主动下线）时
 	// 关闭并换新，供 WaitBridgeListening 等待，替掉原来的 10ms 轮询——轮询是在
 	// 持有端口锁的情况下做的，最坏要占满整个 listenReadyTimeout。
@@ -171,9 +171,8 @@ func (l *bridgeListener) setTarget(toAddr string) {
 	l.target.Store(&toAddr)
 }
 
-func (l *bridgeListener) setBindErr(err error) {
-	s := err.Error()
-	l.bindErr.Store(&s)
+func (l *bridgeListener) setBindErrMessage(message string) {
+	l.bindErr.Store(&message)
 	l.notifyStateChange()
 }
 
@@ -593,10 +592,17 @@ func (l *bridgeListener) supervise(port uint16, fn func(conn net.Conn, toAddr st
 		ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
 		if err != nil {
 			recordListenerError(l, "bind")
-			l.setBindErr(err)
+			bindMessage := err.Error()
+			l.setBindErrMessage(bindMessage)
+			// Do not block the supervisor or WaitBridgeListening on a process lookup.
+			// The raw bind error is available immediately; the owner details are
+			// appended after the platform lookup completes.
+			if isAddressInUse(err) && l.portOwnerLogged.CompareAndSwap(false, true) {
+				go l.lookupPortOwner(port, bindMessage)
+			}
 			backoff = nextBackoff(backoff)
 			slog.Error("bind failed, retrying", "port", port,
-				"toAddr", l.currentTarget(), "backoff", backoff, "err", err)
+				"toAddr", l.currentTarget(), "backoff", backoff, "err", bindMessage)
 			if !l.sleepOrStop(backoff) {
 				return
 			}
@@ -607,6 +613,7 @@ func (l *bridgeListener) supervise(port uint16, fn func(conn net.Conn, toAddr st
 		// 因为同一个原因（EMFILE 等）退出。归零的判定放在 nextRebindBackoff 里，
 		// 以「这次监听是否稳定服务过」为准。
 		l.clearBindErr()
+		l.portOwnerLogged.Store(false)
 		if !l.installListener(ln) {
 			return
 		}
@@ -627,6 +634,20 @@ func (l *bridgeListener) supervise(port uint16, fn func(conn net.Conn, toAddr st
 		if !l.sleepOrStop(backoff) {
 			return
 		}
+	}
+}
+
+func (l *bridgeListener) lookupPortOwner(port uint16, bindMessage string) {
+	if l.closed.Load() {
+		return
+	}
+	owner := lookupPortOwner(int(port))
+	if owner == "" || l.closed.Load() || l.listening.Load() || l.lastBindErr() != bindMessage {
+		return
+	}
+	slog.Error("bind port owner", "port", port, "toAddr", l.currentTarget(), "owner", owner)
+	if !l.closed.Load() && !l.listening.Load() {
+		l.setBindErrMessage(bindMessage + "; " + owner)
 	}
 }
 
@@ -741,7 +762,7 @@ func handlerBridge(conn net.Conn, toAddr string) {
 	listener := listenerForConn(conn)
 	dialStarted := time.Now()
 
-	dstConn, err := net.DialTimeout("tcp", toAddr, dialTimeout)
+	dstConn, err := net.DialTimeout("tcp", toAddr, dialTimeout())
 	if err != nil {
 		recordDial(listener, false, time.Since(dialStarted))
 		slog.Error("dial target", "srcaddr", srcaddr, "toAddr", toAddr, "err", err)
@@ -901,13 +922,40 @@ var copyBufPool = sync.Pool{
 	},
 }
 
-// pipe 单向搬运。io.CopyBuffer 会优先使用 ReadFrom/WriteTo 快路径
-// （Linux 上是 splice，零拷贝、不碰这个缓冲）；只有回退到用户态拷贝时
-// 才用池化缓冲，避免每连接固定 32KB 的分配 churn。
+// pipe 单向搬运。
+//
+// 关键在于什么时候**不**需要缓冲。io.CopyBuffer 的判定顺序是：先看 src 有没有
+// WriteTo、再看 dst 有没有ReadFrom，两者都没有才使用传进来的缓冲
+// （见 io/io.go copyBuffer）。而 *net.TCPConn 同时实现了这两个方法，
+// TCPConn.writeTo 在 Linux 上直接走 spliceTo → splice(2)，全程不碰用户态内存。
+//
+// 也就是说 TCP↔TCP 这条主路径上，池化缓冲从来没被读写过，却被持有到连接结束：
+// 每个方向白占 32KB。线上一条 stats 日志印证了这一点——conns=15716
+// （31432 个方向）时 heapAllocMB=1036，31432×32KB≈982MB，几乎就是全部堆。
+//
+// 所以这里只在两条快路径都不存在时才取缓冲。判定逻辑与 io.copyBuffer 保持一致，
+// 命中的正是包了 idleTimeoutConn 或非 TCP（测试里的 net.Pipe）的回退路径。
 func pipe(dst, src net.Conn) (int64, error) {
+	if hasKernelCopyFastPath(dst, src) {
+		return io.Copy(dst, src)
+	}
 	bufp := copyBufPool.Get().(*[]byte)
 	defer copyBufPool.Put(bufp)
 	return io.CopyBuffer(dst, src, *bufp)
+}
+
+// hasKernelCopyFastPath 判断 io.Copy 会不会绕过用户态缓冲。
+//
+// 刻意用接口断言而不是 *net.TCPConn 类型断言：io.copyBuffer 就是这么判的，
+// 保持一致才能让「我们不取缓冲」和「它不需要缓冲」永远同时成立。
+// idleTimeoutConn 内嵌的是 net.Conn 接口而不是 *net.TCPConn，
+// WriteTo/ReadFrom 不会被提升，所以包装过的连接会正确地落到回退路径。
+func hasKernelCopyFastPath(dst, src net.Conn) bool {
+	if _, ok := src.(io.WriterTo); ok {
+		return true
+	}
+	_, ok := dst.(io.ReaderFrom)
+	return ok
 }
 
 // idleTimeoutConn 在每次读写前把 deadline 顺延，实现「空闲超时」而不是「总时长超时」。
@@ -939,6 +987,21 @@ func connIdleTimeout() time.Duration {
 		return 0
 	}
 	return time.Duration(config.Cfg.ConnIdleTimeout) * time.Second
+}
+
+// dialTimeout 是拨号到上游目标的超时，来自配置，缺省 10 秒。
+//
+// 只覆盖 TCP 握手：SOCKS5 的方法协商、认证、CONNECT 都发生在握手之后，
+// 是被透传的字节流，不受它约束。所以上游「握手很快、CONNECT 慢慢拒绝」的场景
+// （实测能到 7~10 秒）不会被这个超时截断。
+//
+// 不做 ApplyDefaults 之外的兜底：非法值在启动时就已经被换成缺省值；
+// 这里再判一次 <=0 只是为了单元测试里直接改 config.Cfg 时不至于变成无超时。
+func dialTimeout() time.Duration {
+	if config.Cfg.DialTimeout <= 0 {
+		return time.Duration(config.DefaultDialTimeoutSeconds) * time.Second
+	}
+	return time.Duration(config.Cfg.DialTimeout) * time.Second
 }
 
 func maxConnsPerPort() int {

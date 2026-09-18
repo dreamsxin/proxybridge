@@ -52,17 +52,32 @@ type bridgeStatusResponse struct {
 }
 
 // RuntimeStats 是 startStatsLogger 和 /bridge/status 共享的统计快照。
+//
+// 内存字段有四个口径，缺一个就会出现「运维说内存高、日志里看不出来」：
+//   - heapAllocMB：存活的堆对象。不含 goroutine 栈，所以连接数暴涨时它可能几乎不动
+//   - heapSysMB / heapReleasedMB：runtime 为堆保留的量，以及其中已经归还给 OS 的量。
+//     heapSys 高而 heapAlloc 低说明峰值过去了但内存还攥在 runtime 手里
+//   - stackSysMB：goroutine 栈总量。每条连接 2 个 goroutine，几万连接就是几百 MB，
+//     这部分只在这里能看到
+//   - rssMB：进程真实驻留内存，唯一能和 top/ps/监控面板对齐的数字（仅 Linux）
+//
+// 仍然看不见的：内核 socket 收发缓冲。它不属于进程内存，但在容器里会算进 cgroup
+// 的内存账并据此 OOM。所以 rssMB 正常而容器报内存高时，要去看 memory.current。
 type RuntimeStats struct {
-	Goroutines  int    `json:"goroutines"`
-	Bridges     int    `json:"bridges"`
-	Listening   int    `json:"listening"`
-	Conns       int    `json:"conns"`
-	Accepted    int64  `json:"accepted"`
-	Rejected    int64  `json:"rejected"`
-	DialOK      int64  `json:"dialOK"`
-	DialFail    int64  `json:"dialFail"`
-	HeapAllocMB uint64 `json:"heapAllocMB"`
-	SysMB       uint64 `json:"sysMB"`
+	Goroutines     int    `json:"goroutines"`
+	Bridges        int    `json:"bridges"`
+	Listening      int    `json:"listening"`
+	Conns          int    `json:"conns"`
+	Accepted       int64  `json:"accepted"`
+	Rejected       int64  `json:"rejected"`
+	DialOK         int64  `json:"dialOK"`
+	DialFail       int64  `json:"dialFail"`
+	HeapAllocMB    uint64 `json:"heapAllocMB"`
+	HeapSysMB      uint64 `json:"heapSysMB"`
+	HeapReleasedMB uint64 `json:"heapReleasedMB"`
+	StackSysMB     uint64 `json:"stackSysMB"`
+	RSSMB          uint64 `json:"rssMB"`
+	SysMB          uint64 `json:"sysMB"`
 	NumGC       uint32 `json:"numGC"`
 }
 
@@ -102,9 +117,13 @@ func CollectRuntimeStats() RuntimeStats {
 		Rejected:    bridgeStats.Rejected,
 		DialOK:      bridgeStats.DialOK,
 		DialFail:    bridgeStats.DialFail,
-		HeapAllocMB: memStats.HeapAlloc >> 20,
-		SysMB:       memStats.Sys >> 20,
-		NumGC:       memStats.NumGC,
+		HeapAllocMB:    memStats.HeapAlloc >> 20,
+		HeapSysMB:      memStats.HeapSys >> 20,
+		HeapReleasedMB: memStats.HeapReleased >> 20,
+		StackSysMB:     memStats.StackSys >> 20,
+		RSSMB:          processRSSBytes() >> 20,
+		SysMB:          memStats.Sys >> 20,
+		NumGC:          memStats.NumGC,
 	}
 }
 
@@ -222,10 +241,11 @@ func RuntimeBridgeStatus(bridgePort uint16, proxyAddr string, check bool) []dto.
 			continue
 		}
 		status := dto.BridgeStatus{
-			BridgePort: port,
-			ProxyAddr:  toAddr,
-			Listening:  !listener.closed.Load() && listener.listening.Load(),
-			BindErr:    listener.lastBindErr(),
+			BridgePort:   port,
+			ProxyAddr:    toAddr,
+			Listening:    !listener.closed.Load() && listener.listening.Load(),
+			DialFailures: listener.dialFail.Load(),
+			BindErr:      listener.lastBindErr(),
 		}
 		if !status.Listening {
 			status.FailureReason, status.Solution = bridgeStatusAdvice(status, false)
@@ -272,6 +292,7 @@ func bridgeStatusMatches(port uint16, toAddr string, bridgePort uint16, proxyAdd
 }
 
 func checkRuntimeBridge(status dto.BridgeStatus) dto.BridgeStatus {
+	status.Checked = true
 	status.BridgeTCP, status.BridgeErr = tcpReachable(net.JoinHostPort("127.0.0.1", strconv.Itoa(int(status.BridgePort))))
 	status.ProxyTCP, status.ProxyErr = tcpReachable(status.ProxyAddr)
 	status.OK = status.Listening && status.BridgeTCP && status.ProxyTCP

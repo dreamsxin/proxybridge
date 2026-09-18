@@ -35,6 +35,8 @@ type BridgeStatus struct {
 	BridgePort    uint16 `json:"bridgePort"`
 	ProxyAddr     string `json:"proxyAddr"`
 	Listening     bool   `json:"listening"`
+	DialFailures  int64  `json:"dial_failures"`
+	Checked       bool   `json:"checked"`
 	BridgeTCP     bool   `json:"bridgeTcp"`
 	ProxyTCP      bool   `json:"proxyTcp"`
 	OK            bool   `json:"ok"`

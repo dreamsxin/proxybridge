@@ -48,6 +48,7 @@ type bridgeStatus struct {
 	BridgePort    uint16 `json:"bridgePort"`
 	ProxyAddr     string `json:"proxyAddr"`
 	Listening     bool   `json:"listening"`
+	Checked       bool   `json:"checked"`
 	BridgeTCP     bool   `json:"bridgeTcp"`
 	ProxyTCP      bool   `json:"proxyTcp"`
 	OK            bool   `json:"ok"`
@@ -264,6 +265,11 @@ func printSummary(summary operatorSummary) {
 		summary.Source, summary.URL, summary.CollectedAt.Format(time.RFC3339), s.Bridges, s.Listening,
 		s.Conns, s.Accepted, s.Rejected, s.DialOK, s.DialFail, s.Goroutines, s.HeapAllocMB, s.SysMB, s.NumGC)
 	for _, bridge := range summary.Bridges {
+		if !bridge.Checked {
+			fmt.Printf("bridge port=%d proxy=%s listening=%t health=not_checked hint=use -check\n",
+				bridge.BridgePort, bridge.ProxyAddr, bridge.Listening)
+			continue
+		}
 		fmt.Printf("bridge port=%d proxy=%s listening=%t bridgeTcp=%t proxyTcp=%t ok=%t reason=%s\n",
 			bridge.BridgePort, bridge.ProxyAddr, bridge.Listening, bridge.BridgeTCP, bridge.ProxyTCP, bridge.OK, bridge.FailureReason)
 	}

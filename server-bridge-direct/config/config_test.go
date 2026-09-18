@@ -32,6 +32,10 @@ func TestApplyDefaultsFillsMissingValues(t *testing.T) {
 	if c.LogSource {
 		t.Error("logSource should default to false")
 	}
+	// 拨号超时缺省必须是改成可配之前的硬编码值，升级不改变行为
+	if c.DialTimeout != DefaultDialTimeoutSeconds {
+		t.Errorf("dialTimeout = %d, want %d", c.DialTimeout, DefaultDialTimeoutSeconds)
+	}
 }
 
 // 显式配置不能被缺省值覆盖，包括显式关闭压缩
@@ -45,11 +49,15 @@ func TestApplyDefaultsKeepsExplicitValues(t *testing.T) {
 		LogMaxBackups: 2,
 		LogCompress:   &off,
 		LogConsole:    true,
+		DialTimeout:   3,
 	}
 	c.ApplyDefaults()
 
 	if c.LogLevel != "debug" || c.LogFormat != "json" {
 		t.Errorf("level/format overwritten: %q %q", c.LogLevel, c.LogFormat)
+	}
+	if c.DialTimeout != 3 {
+		t.Errorf("dialTimeout overwritten: %d", c.DialTimeout)
 	}
 	if c.LogMaxSizeMB != 5 || c.LogMaxAgeDays != 1 || c.LogMaxBackups != 2 {
 		t.Errorf("rotation overwritten: %d %d %d", c.LogMaxSizeMB, c.LogMaxAgeDays, c.LogMaxBackups)

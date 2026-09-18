@@ -177,6 +177,14 @@ func startStatsLogger(intervalSec int) {
 				"dialOK", stats.DialOK,
 				"dialFail", stats.DialFail,
 				"heapAllocMB", stats.HeapAllocMB,
+				// heapSys 高而 heapAlloc 低 = 峰值已过但内存还攥在 runtime 手里
+				"heapSysMB", stats.HeapSysMB,
+				"heapReleasedMB", stats.HeapReleasedMB,
+				// 每条连接 2 个 goroutine，几万连接的栈就是几百 MB，
+				// 这部分不在 heapAlloc 里，只能看这个字段
+				"stackSysMB", stats.StackSysMB,
+				// rss 是唯一能和 top/ps/监控面板对齐的数字（仅 Linux，其他平台为 0）
+				"rssMB", stats.RSSMB,
 				"sysMB", stats.SysMB,
 				"numGC", stats.NumGC)
 		}

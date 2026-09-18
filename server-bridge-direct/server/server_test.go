@@ -89,13 +89,20 @@ func TestGetBridgeStatusReportsHealthyRuntime(t *testing.T) {
 	if resp := performAddBridge(t, dto.UseBridge{BridgePort: bridgePort, Ip: target.host, Port: target.port}); resp.Code != 200 {
 		t.Fatalf("add failed: %+v", resp)
 	}
+	runMu.RLock()
+	listener := runListens[bridgePort]
+	runMu.RUnlock()
+	if listener == nil {
+		t.Fatalf("listener for port %d not found", bridgePort)
+	}
+	recordDial(listener, false, time.Millisecond)
 
 	statuses := RuntimeBridgeStatus(bridgePort, proxyAddr, true)
 	if len(statuses) != 1 {
 		t.Fatalf("statuses = %+v, want one result", statuses)
 	}
 	status := statuses[0]
-	if status.BridgePort != bridgePort || status.ProxyAddr != proxyAddr || !status.Listening || !status.BridgeTCP || !status.ProxyTCP || !status.OK {
+	if status.BridgePort != bridgePort || status.ProxyAddr != proxyAddr || !status.Listening || !status.BridgeTCP || !status.ProxyTCP || !status.OK || status.DialFailures != 1 {
 		t.Fatalf("unhealthy runtime status: %+v", status)
 	}
 
@@ -113,7 +120,7 @@ func TestGetBridgeStatusReportsHealthyRuntime(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("response %q: %v", rec.Body.String(), err)
 	}
-	if resp.Code != 200 || len(resp.Data) != 1 || !resp.Data[0].OK {
+	if resp.Code != 200 || len(resp.Data) != 1 || !resp.Data[0].Checked || !resp.Data[0].OK {
 		t.Fatalf("unexpected status response: %+v", resp)
 	}
 	if resp.Stats.Bridges < 1 || resp.Stats.Listening < 1 || resp.Stats.Goroutines < 1 {
@@ -775,12 +782,31 @@ func TestAddConnDistinguishesClosingFromLimit(t *testing.T) {
 	}
 }
 
+// 拨号超时来自配置；非法值退回缺省，绝不能退化成「无超时」
+func TestDialTimeoutFollowsConfig(t *testing.T) {
+	prev := config.Cfg.DialTimeout
+	t.Cleanup(func() { config.Cfg.DialTimeout = prev })
+
+	config.Cfg.DialTimeout = 3
+	if got := dialTimeout(); got != 3*time.Second {
+		t.Fatalf("dialTimeout() = %v, want 3s", got)
+	}
+
+	fallback := time.Duration(config.DefaultDialTimeoutSeconds) * time.Second
+	for _, invalid := range []int{0, -1} {
+		config.Cfg.DialTimeout = invalid
+		if got := dialTimeout(); got != fallback {
+			t.Fatalf("dialTimeout() with %d = %v, want %v", invalid, got, fallback)
+		}
+	}
+}
+
 // bind 已经失败过就立刻回报，不把持着端口锁的调用方吊到超时
 func TestWaitBridgeListeningReportsBindErrorImmediately(t *testing.T) {
 	port := freeTCPPort(t)
 	l := newBridgeListener("127.0.0.1:1")
 	l.port = port
-	l.setBindErr(errors.New("listen tcp :0: bind: address already in use"))
+	l.setBindErrMessage("listen tcp :0: bind: address already in use")
 
 	runMu.Lock()
 	runListens[port] = l
